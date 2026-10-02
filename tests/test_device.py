@@ -194,3 +194,37 @@ def test_cmd_dump_prints_address_rows(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "bank 0x08" in out
     assert "80: 82 00" in out  # 0x80 有值，0x81 未设置读回 0
+
+
+# --- watch：区分"没数据"和"有数据但没认出来" --------------------------------
+def test_cmd_watch_labels_recognised_and_unknown_frames(monkeypatch, capsys):
+    from fakes import FakeTransport, status_frame
+
+    from rapoo_autoswitch.device import DeviceInfo, Session
+
+    transport = FakeTransport(status_frames=[status_frame(battery=63), bytes([0x99, 0x01])])
+    session = Session(transport)
+    monkeypatch.setattr(cli, "_open_session", lambda vid: (DeviceInfo(0x1464, "x"), session))
+
+    args = cli.build_parser().parse_args(["watch", "--seconds", "0.05", "--count", "5"])
+    assert cli.cmd_watch(args) == 0
+
+    out = capsys.readouterr().out
+    assert "状态帧" in out and "未识别" in out
+    assert "电量 63%" in out
+
+
+def test_cmd_watch_reports_silence(monkeypatch, capsys):
+    from fakes import FakeTransport
+
+    from rapoo_autoswitch.device import DeviceInfo, Session
+
+    session = Session(FakeTransport())
+    monkeypatch.setattr(cli, "_open_session", lambda vid: (DeviceInfo(0x1464, "x"), session))
+
+    args = cli.build_parser().parse_args(["watch", "--seconds", "0.05"])
+    assert cli.cmd_watch(args) == 0
+
+    out = capsys.readouterr().out
+    assert "共收到 0 帧" in out
+    assert "被其它程序读走" in out

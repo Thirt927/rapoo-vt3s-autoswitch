@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+import time
 from typing import List, Optional
 
 from . import __version__, autostart, daemon
@@ -76,12 +77,23 @@ def cmd_list(args) -> int:
     return 0
 
 
+def _no_broadcast_hint() -> None:
+    print("没有收到状态广播。")
+    print("排查建议：")
+    print("  1) 晃一下鼠标再试——状态报文通常是设备主动推的；")
+    print("  2) 确认没有别的程序正占用状态接口：HID 输入报文是「谁先读谁拿到」，")
+    print("     不是广播给所有进程。本工具的 tray、官方 A-Hub 都会把报文读走，")
+    print("     请先退出它们（托盘图标右键→退出）；")
+    print("  3) 用 `rapoo-autoswitch watch` 直接看原始字节：")
+    print("     一帧都没有 = 报文被别处读走；有帧但显示「未识别」= 解析规则要调整。")
+
+
 def cmd_status(args) -> int:
     device, session = _open_session(args.vendor_id)
     with session:
         report = session.wait_status(timeout_s=args.timeout)
     if report is None:
-        print("没有收到状态广播。动一下鼠标再试。")
+        _no_broadcast_hint()
         return 1
     link = "有线" if report.wired else "2.4G"
     charge = "，充电中" if report.charging else ""
@@ -90,6 +102,40 @@ def cmd_status(args) -> int:
     print(f"  DPI 档位  {report.dpi_level}")
     print(f"  DPI       {report.dpi_x} x {report.dpi_y}")
     print(f"  状态位    0x{report.status_byte:02x}")
+    return 0
+
+
+def cmd_watch(args) -> int:
+    """直接打印状态接口收到的原始字节，用于排查"收不到状态广播"。
+
+    能区分两种完全不同的情况：
+
+    * **一条都没有** —— 报文被别的程序读走了（HID 输入报文谁先读谁拿到），
+      或者该接口根本没有数据；
+    * **有帧但显示「未识别」** —— 数据到我们手上了，是解析规则（设备标记、
+      报文 ID）需要调整。
+    """
+    device, session = _open_session(args.vendor_id)
+    print(f"监听 {device} 的状态接口 {args.seconds} 秒，请晃动鼠标…")
+    deadline = time.monotonic() + args.seconds
+    seen = 0
+    with session:
+        while time.monotonic() < deadline and seen < args.count:
+            raw = session.transport.read_status(args.timeout_ms)
+            if not raw:
+                continue
+            seen += 1
+            report = p.parse_status(raw)
+            print(f"[{seen}] {'状态帧' if report else '未识别'} len={len(raw)}  {bytes(raw).hex(' ')}")
+            if report is not None:
+                link = "有线" if report.wired else "2.4G"
+                print(
+                    f"      电量 {report.battery}%  {link}  "
+                    f"档位 {report.dpi_level}  DPI {report.dpi_x}x{report.dpi_y}"
+                )
+    print(f"共收到 {seen} 帧")
+    if seen == 0:
+        print("一帧都没有 -> 报文很可能是被其它程序读走了（见 `status` 的排查建议第 2 条）。")
     return 0
 
 
@@ -369,6 +415,12 @@ def build_parser() -> argparse.ArgumentParser:
     status = sub.add_parser("status", help="查看电量 / DPI / 连接方式")
     status.add_argument("--timeout", type=float, default=2.0, help="等待状态广播的秒数")
     status.set_defaults(func=cmd_status)
+
+    watch = sub.add_parser("watch", help="打印状态接口的原始字节，排查收不到广播")
+    watch.add_argument("--seconds", type=float, default=10.0, help="监听时长，默认 10 秒")
+    watch.add_argument("--timeout-ms", type=int, default=100, help="单次读取超时，默认 100ms")
+    watch.add_argument("--count", type=int, default=20, help="收到多少帧后停止，默认 20")
+    watch.set_defaults(func=cmd_watch)
 
     battery = sub.add_parser("battery", help="只输出电量")
     battery.add_argument("--timeout", type=float, default=2.0)

@@ -128,6 +128,7 @@ rapoo-autoswitch startup install
 | --- | --- |
 | `list` | 列出已连接的雷柏二代鼠标及其接口路径 |
 | `status` | 电量、DPI 档位与数值、连接方式、充电状态 |
+| `watch` | 打印状态接口的原始字节，排查"收不到电量广播" |
 | `battery` | 只打印电量，便于脚本/状态栏取用 |
 | `dpi` | 查看各档 DPI；`dpi 800,1600,3200` 设置，`dpi --index 2` 切当前档位 |
 | `get [寄存器...]` | 读取寄存器并解码显示 |
@@ -178,7 +179,7 @@ src/rapoo_autoswitch/
   tray.py        托盘常驻版（电量图标 + 切换配置菜单）
   autostart.py   Windows 开机自启
   cli.py         命令行入口
-tests/           61 个用例，全部不需要硬件
+tests/           63 个用例，全部不需要硬件
 docs/PROTOCOL.md 逆向出的协议细节与来源
 ```
 
