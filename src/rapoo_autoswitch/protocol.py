@@ -12,7 +12,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 VENDOR_ID = 0x24AE
 """雷柏通用 USB Vendor ID。二代机型（VT3S / VT7 / VT3 MAX ...）都在此 VID 下。"""
@@ -43,13 +43,87 @@ MAX_PAYLOAD = 25
 BANK_COMM = 0x00
 BANK_BUTTON = 0x06
 BANK_SYSTEM = 0x08
-"""系统设置银行：DPI、回报率、休眠、LOD 等都在这里。"""
+"""系统设置银行：DPI、回报率、休眠、LOD 等都在这里。
+
+注意：这里指的是**第 0 组**板载配置的系统银行。设备实际有多组配置，
+真正生效的是哪一组由 ``ADDR_ACTIVE_PROFILE`` 决定，见下。
+"""
+
+# --- 板载配置分组 ---------------------------------------------------------
+BANK_PROFILE_INFO = 0x01
+"""记录"当前选中哪一组板载配置"的银行。"""
+
+ADDR_ACTIVE_PROFILE = 0x0C
+"""``bank 0x01`` 偏移 ``0x0C``：当前生效的配置组号（0 起）。
+
+实测（VT3S V2）：写 ``0`` 生效第 0 组、写 ``1`` 生效第 1 组，实时配置随之切换。
+"""
+
+PROFILE_STRIDE = 4
+"""每组板载配置占 4 个 bank：按键 / 保留 / 系统 / 名字。
+
+实测分组（VT3S V2）：
+
+======  =========  =========  ===================
+组      按键 bank  系统 bank  名字 bank（0xEE 起）
+======  =========  =========  ===================
+0       0x06       0x08       0x09（"CFG1"）
+1       0x0A       0x0C       0x0D（"办公"）
+======  =========  =========  ===================
+
+**只有当前选中那一组会真正生效**——写其他组的 bank，回读校验会通过，但鼠标行为不变。
+"""
+
+
+def system_bank_for(profile_index: int) -> int:
+    """第 N 组板载配置的系统 bank：0 → 0x08、1 → 0x0C、2 → 0x10 …"""
+    return BANK_SYSTEM + PROFILE_STRIDE * profile_index
+
 
 # --- DPI 相关寄存器地址（bank 0x08）----------------------------------------
 ADDR_DPI_TABLE_X = 0x88
 ADDR_DPI_TABLE_Y = 0xC8
 ADDR_DPI_SLOT_COUNT = 0x96
 ADDR_DPI_ACTIVE_INDEX = 0x98
+
+ADDR_PERFORMANCE = 0xDC
+PERFORMANCE_BYTES = 7
+"""性能模式块（``0xDC..0xE2``，7 字节）。
+
+对应 A-Hub 的「性能模式」（办公/均衡/火力/超核/竞技超核/狂暴竞技）。实测这块是
+**随回报率联动**的复合结构，不是单个字节：同一回报率下切档只动 ``0xDE``；回报率
+一变，``0xDC``/``0xDD``/``0xE2`` 也会跟着改。因此这里**不做语义解码**，按原始字节
+整块存取（与快照"原样备份还原"的定位一致）。
+
+注意：A-Hub 里回报率与性能模式是**联动限制**的——125/250Hz 只能用后两档、500Hz
+最高火力、1000Hz 最低均衡、2000Hz 最低火力、4000/8000Hz 只能前 3 档。写入必须
+整组一致，不要混搭不同回报率下的取值。
+"""
+
+PERFORMANCE_MODE_OFFSET = 0xDE - ADDR_PERFORMANCE
+"""档位字节在块内的下标。同一回报率下切档只动这一个字节。"""
+
+PERFORMANCE_MODE_NAMES: Dict[Tuple[int, int], str] = {
+    # (回报率 Hz, 档位字节) -> A-Hub 里的档位名。
+    # 同一个字节在不同回报率下含义不同：500Hz 的 0x02 是「火力」，而 8000Hz 的
+    # 0x02 是「竞技超核」，所以必须连回报率一起查，不能只看字节。
+    (500, 0x00): "办公",
+    (500, 0x02): "火力",
+    (8000, 0x02): "竞技超核",
+}
+"""性能模式档位名——**只登记实测确认过的组合**。
+
+6 档依次是办公 / 均衡 / 火力 / 超核 / 竞技超核 / 狂暴竞技，但整块字节随回报率联动，
+目前实测样本还很少（见 docs/PROTOCOL.md）。查不到时这里返回 ``None``，由调用方原样
+显示字节：**宁可写"未知"，也不要猜错档位名**。
+"""
+
+
+def performance_mode_name(polling_hz: Optional[int], raw: bytes) -> Optional[str]:
+    """按（回报率, 档位字节）查档位名；没实测过的组合返回 ``None``。"""
+    if len(raw) <= PERFORMANCE_MODE_OFFSET:
+        return None
+    return PERFORMANCE_MODE_NAMES.get((polling_hz, raw[PERFORMANCE_MODE_OFFSET]))
 
 DPI_MAX_SLOTS = 6
 """最多 6 档 DPI。"""
@@ -214,6 +288,8 @@ class Register:
                 int.from_bytes(raw[i * 2:i * 2 + 2], "little")
                 for i in range(len(raw) // 2)
             ]
+        if self.kind == "blob":
+            return bytes(raw)
         value = raw[0] if self.length == 1 else raw
         if self.kind == "polling":
             return POLLING_CODE_TO_HZ.get(value, value)
@@ -235,6 +311,11 @@ class Register:
             if isinstance(value, str):
                 values = [int(part) for part in value.replace(",", " ").split()]
             return b"".join(int(v).to_bytes(2, "little") for v in values)
+        if self.kind == "blob":
+            # 十六进制串（可带空格）或原始字节，长度必须正好
+            if isinstance(value, str):
+                return bytes.fromhex(value.replace(" ", "").replace(":", ""))
+            return bytes(value)
         if self.kind == "polling":
             hz = int(value)
             if hz not in POLLING_HZ_TO_CODE:
@@ -297,11 +378,19 @@ SYSTEM_REGISTERS: List[Register] = [
     ),
     Register(BANK_SYSTEM, 0xC4, "sensor_angle", kind="angle", order=48, help="传感器角度"),
     Register(BANK_SYSTEM, 0xC5, "glass_mode", kind="bool", order=49, help="玻璃模式"),
+    # --- 性能模式（A-Hub 里的"扫描率"档位）---
+    # 必须排在回报率（0x80，order=40）之后：固件会按回报率重排这一块，
+    # 先写回报率再写它，才不会互相覆盖。
+    Register(
+        BANK_SYSTEM, ADDR_PERFORMANCE, "performance_mode", length=PERFORMANCE_BYTES,
+        kind="blob", order=50,
+        help="性能模式块 0xDC..0xE2（随回报率联动，按原始字节存取）",
+    ),
 ]
 """快照默认覆盖的系统寄存器。
 
-下发时会按 ``Register.order`` 排序，保证 DPI 表先于档位数/当前档位写入。
-未实测机型请先 ``probe`` 确认后再写入。
+下发时会按 ``Register.order`` 排序：DPI 表先于档位数/当前档位，性能模式块排在
+回报率之后。未实测机型请先 ``probe`` 确认后再写入。
 """
 
 REGISTRY: Dict[str, Register] = {r.name: r for r in SYSTEM_REGISTERS}

@@ -154,3 +154,15 @@ def test_dpi_registers_declare_write_order():
     assert p.REGISTRY["dpi_slot_count"].order < p.REGISTRY["dpi_active_index"].order
     assert p.REGISTRY_BY_KEY["08:88"].name == "dpi_table_x"
     assert p.DPI_SLOT_COUNT_KEY == "08:96"
+
+
+def test_performance_mode_name_only_maps_verified_combinations():
+    """档位名只认实测过的（回报率, 字节）组合，其余返回 None 而不是猜。"""
+    assert p.performance_mode_name(500, bytes.fromhex("00000001020303")) == "办公"
+    assert p.performance_mode_name(500, bytes.fromhex("00000201020303")) == "火力"
+    assert p.performance_mode_name(8000, bytes.fromhex("01010201020305")) == "竞技超核"
+    # 同一个档位字节在不同回报率下含义不同：不能只看字节
+    assert p.performance_mode_name(1000, bytes.fromhex("00000201020303")) is None
+    # 没实测过的组合、以及长度不足的块，都由调用方原样显示字节
+    assert p.performance_mode_name(8000, bytes.fromhex("01010301020305")) is None
+    assert p.performance_mode_name(500, b"\x00") is None

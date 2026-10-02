@@ -13,15 +13,17 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
+import subprocess
 import sys
 import time
-from typing import List, Optional
+from typing import IO, List, Optional
 
-from . import __version__, autostart, daemon
+from . import __version__, autostart, daemon, doctor
 from . import device as dev
 from . import profiles
 from . import protocol as p
-from .config import load_config, machine_name, set_preset
+from .config import config_dir, load_config, machine_name, set_preset
 
 
 # --------------------------------------------------------------------------
@@ -36,10 +38,100 @@ def _open_session(vendor_id: int):
     return found, dev.open_session(found)
 
 
+def _log_stream() -> Optional[IO[str]]:
+    """托盘脱离控制台后用来接住日志的文件；开不出来就退回空设备。"""
+    try:
+        return open(config_dir() / "tray.log", "a", encoding="utf-8")
+    except OSError:
+        try:
+            return open(os.devnull, "w", encoding="utf-8")
+        except OSError:
+            return None
+
+
+def _detach_console() -> None:
+    """从当前控制台脱离，并把输出改写到日志文件。
+
+    托盘是常驻后台程序。若从终端启动，它挂在那个控制台上，**终端一关就被一起
+    杀掉**（用户实际遇到的坑）。调用 ``FreeConsole`` 脱离之后，终端关闭不再
+    影响它；双击启动时那个黑框也会因为"没有进程附着"而自动消失。
+
+    脱离后原来的 stdout/stderr 句柄已失效，再写会报错，所以顺手改成日志文件——
+    后台跑的东西出了问题总得有个地方可查。
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.kernel32.FreeConsole()
+    except Exception:  # noqa: BLE001 - 脱不了就照常跑
+        return
+    stream = _log_stream()
+    if stream is not None:
+        sys.stdout = stream
+        sys.stderr = stream
+
+
+def _spawn_detached(argv: List[str]) -> None:
+    """把常驻程序拉成独立进程，和当前控制台彻底断开。
+
+    菜单里选「托盘常驻」时用：当前进程还要继续显示菜单，不能自己也脱掉控制台，
+    所以另起一个进程去跑 tray。这样关掉菜单窗口也不会带走托盘。
+    """
+    if getattr(sys, "frozen", False):
+        cmd = [sys.executable, *argv]
+    else:
+        cmd = [sys.executable, "-m", "rapoo_autoswitch", *argv]
+    # DETACHED_PROCESS | CREATE_NO_WINDOW：不附控制台，也不弹黑框
+    flags = (0x00000008 | 0x08000000) if sys.platform == "win32" else 0
+    try:
+        subprocess.Popen(cmd, creationflags=flags, close_fds=True)
+    except OSError as exc:
+        print(f"  启动失败：{exc}")
+
+
+def _acquire_singleton() -> bool:
+    """标记"托盘已在本机运行"，防止同时跑出两个。
+
+    两个托盘会一起抢状态接口（HID 输入报文谁先读谁拿到），结果是两边都读不到
+    电量。用带名字的内核互斥体判断：进程退出时系统自动释放，不会残留。
+    """
+    if sys.platform != "win32":
+        return True
+    try:
+        import ctypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateMutexW(None, False, "rapoo-autoswitch-tray")
+        # 183 = ERROR_ALREADY_EXISTS，说明已经有一个在跑了
+        return ctypes.get_last_error() != 183
+    except Exception:  # noqa: BLE001 - 判断不了就放行
+        return True
+
+
+def _hide_console() -> None:
+    """把自己的控制台窗口藏起来。
+
+    给开机自启的 ``--hidden`` 用：那时用户不想看见黑框。托盘另有
+    ``_detach_console`` 直接脱控制台，连窗口都不需要藏。
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.user32.ShowWindow(ctypes.windll.kernel32.GetConsoleWindow(), 0)
+    except Exception:  # noqa: BLE001 - 拿不到窗口就算了，不影响功能
+        pass
+
+
 def _decode(reg: p.Register, raw: bytes) -> str:
     if reg.kind == "dpi_table":
         values = reg.decode(raw)
         return " / ".join(str(v) for v in values) if values else "（空）"
+    if reg.kind == "blob":
+        return raw.hex(" ")
     if reg.name == "linear_ripple":
         byte = raw[0]
         return f"直线修正{'关' if byte & 0x01 else '开'}，波纹{'关' if byte & 0x02 else '开'}"
@@ -55,8 +147,8 @@ def _decode(reg: p.Register, raw: bytes) -> str:
 
 def _parse_value(reg: p.Register, text: str):
     lowered = text.strip().lower()
-    if reg.kind == "dpi_table":
-        return text  # encode() 会解析 "800,1600" 这种写法
+    if reg.kind in ("dpi_table", "blob"):
+        return text  # encode() 会解析这类"整段"取值
     if reg.kind == "bool":
         return lowered in ("1", "on", "true", "yes", "开", "true")
     return int(text, 0)
@@ -80,7 +172,8 @@ def cmd_list(args) -> int:
 def _no_broadcast_hint() -> None:
     print("没有收到状态广播。")
     print("排查建议：")
-    print("  1) 晃一下鼠标再试——状态报文通常是设备主动推的；")
+    print("  1) 晃一下鼠标再试——状态报文通常是设备主动推的，鼠标休眠时会停推；")
+    print("     默认休眠 10 分钟，动一下或按个键唤醒即可；")
     print("  2) 确认没有别的程序正占用状态接口：HID 输入报文是「谁先读谁拿到」，")
     print("     不是广播给所有进程。本工具的 tray、官方 A-Hub 都会把报文读走，")
     print("     请先退出它们（托盘图标右键→退出）；")
@@ -88,11 +181,41 @@ def _no_broadcast_hint() -> None:
     print("     一帧都没有 = 报文被别处读走；有帧但显示「未识别」= 解析规则要调整。")
 
 
+def _performance_lines(session) -> List[str]:
+    """读回报率与性能模式（A-Hub 的"扫描率"档位），拼成 status 的附加行。
+
+    这两项在状态广播里没有，得主动读寄存器——和电量走的是两条独立的路，所以
+    即使 A-Hub 抢走状态接口、收不到广播，它们照样显示得出来。
+    """
+    lines: List[str] = []
+    polling: Optional[int] = None
+    try:
+        reg = p.REGISTRY["polling_hz"]
+        polling = reg.decode(session.read_register(reg))
+        lines.append(f"  回报率    {polling} Hz")
+    except dev.DeviceError as exc:
+        lines.append(f"  回报率    读取失败（{exc}）")
+
+    try:
+        raw = session.read_register(p.REGISTRY["performance_mode"])
+        name = p.performance_mode_name(polling, raw)
+        # 档位名只认实测确认过的组合；没见过的就如实报字节，不猜
+        shown = name if name else f"未知（{raw.hex(' ')}）"
+        lines.append(f"  性能模式  {shown}")
+    except dev.DeviceError as exc:
+        lines.append(f"  性能模式  读取失败（{exc}）")
+    return lines
+
+
 def cmd_status(args) -> int:
     device, session = _open_session(args.vendor_id)
     with session:
+        extra = _performance_lines(session)
         report = session.wait_status(timeout_s=args.timeout)
     if report is None:
+        print(device.model)
+        print("\n".join(extra))
+        print()
         _no_broadcast_hint()
         return 1
     link = "有线" if report.wired else "2.4G"
@@ -101,6 +224,7 @@ def cmd_status(args) -> int:
     print(f"  电量      {report.battery}%")
     print(f"  DPI 档位  {report.dpi_level}")
     print(f"  DPI       {report.dpi_x} x {report.dpi_y}")
+    print("\n".join(extra))
     print(f"  状态位    0x{report.status_byte:02x}")
     return 0
 
@@ -146,7 +270,7 @@ def cmd_battery(args) -> int:
     if report is None:
         print("没有收到状态广播。")
         return 1
-    suffix = " ⚡" if report.charging else ""
+    suffix = " [charging]" if report.charging else ""
     print(f"{report.battery}%{suffix}")
     return 0
 
@@ -351,6 +475,13 @@ def cmd_current(args) -> int:
 def cmd_tray(args) -> int:
     from .tray import POLL_S, TrayApp
 
+    if not _acquire_singleton():
+        print("托盘已经在运行了，看右下角托盘区的小图标。这个窗口可以关掉。")
+        return 0
+    if getattr(args, "hidden", False):
+        _hide_console()
+    # 托盘是长住后台的：先脱离控制台，这样从终端启动后关掉终端也不影响它
+    _detach_console()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     app = TrayApp(preset=args.preset, interval=args.interval or POLL_S)
     app.run()
@@ -358,6 +489,8 @@ def cmd_tray(args) -> int:
 
 
 def cmd_daemon(args) -> int:
+    if getattr(args, "hidden", False):
+        _hide_console()
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
     )
@@ -384,14 +517,77 @@ def cmd_daemon(args) -> int:
 
 def cmd_startup(args) -> int:
     if args.action == "install":
-        cmd = autostart.install()
-        print(f"已写入开机自启：{cmd}")
+        cmd = autostart.install(args.mode)
+        print(f"已写入开机自启（{args.mode}）：{cmd}")
     elif args.action == "uninstall":
         autostart.uninstall()
         print("已移除开机自启。")
     else:
         current = autostart.current()
         print(f"开机自启：{current or '（未设置）'}")
+    return 0
+
+
+def cmd_doctor(args) -> int:
+    """环境自检；装不上或用不了时先跑这个。"""
+    return doctor.run()
+
+
+def _ask(prompt: str, default: str = "") -> str:
+    """读一行输入；非交互（管道/EOF）时返回默认值，方便脚本调用。"""
+    try:
+        answer = input(prompt).strip()
+    except EOFError:
+        return default
+    return answer or default
+
+
+def cmd_setup(args) -> int:
+    """交互式向导：采集快照 → 设为本机预设 → 选择常驻方式。"""
+    print("rapoo-autoswitch 上手向导（直接回车 = 用括号里的默认值）")
+    print()
+
+    found = dev.first_device(args.vendor_id)
+    if found is None:
+        print("没找到雷柏二代鼠标。插好接收器/鼠标后再跑一次。")
+        return 1
+    print(f"检测到：{found}")
+    print()
+
+    name = _ask("快照名（会保存当前鼠标配置）[本机]：", "本机")
+    _, session = _open_session(args.vendor_id)
+    with session:
+        snapshot = profiles.capture(session, name, found.product_id)
+    if not snapshot.registers:
+        print("没有采到任何寄存器，已放弃。")
+        return 1
+    profiles.save(snapshot)
+    print(f"已保存快照「{name}」（{snapshot.size} 项）")
+
+    if _ask("把本机预设设为它？[Y/n]：", "y").lower() in ("y", "yes", "是"):
+        set_preset(name)
+        print(f"本机预设 → 「{name}」")
+
+    print()
+    print("常驻方式：")
+    print("  1) daemon  无界面，插上就自动下发（推荐）")
+    print("  2) tray    托盘图标，能看电量、右键切配置")
+    print("  3) 先不装，我自己跑")
+    choice = _ask("选择 [1]：", "1")
+    mode = {"1": "daemon", "2": "tray", "daemon": "daemon", "tray": "tray"}.get(choice)
+    if mode:
+        try:
+            cmd = autostart.install(mode)
+            print(f"已设置开机自启（{mode}）：{cmd}")
+        except RuntimeError as exc:
+            print(f"跳过开机自启：{exc}")
+    else:
+        print("跳过开机自启。")
+
+    print()
+    print("完成。注意两点：")
+    print("  · 别让官方 A-Hub 常驻——它会抢状态接口，还可能改掉你的配置；")
+    print("  · 换电脑后，在那台电脑上各跑一次本向导即可。")
     return 0
 
 
@@ -410,10 +606,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
+    sub.add_parser("doctor", help="环境自检：装不上或用不了，先跑它").set_defaults(func=cmd_doctor)
+
+    sub.add_parser("setup", help="上手向导：采集配置、设预设、装开机自启").set_defaults(
+        func=cmd_setup
+    )
+
     sub.add_parser("list", help="列出已连接的雷柏二代鼠标").set_defaults(func=cmd_list)
 
     status = sub.add_parser("status", help="查看电量 / DPI / 连接方式")
-    status.add_argument("--timeout", type=float, default=2.0, help="等待状态广播的秒数")
+    status.add_argument(
+        "--timeout", type=float, default=6.0,
+        help="等待状态广播的秒数（设备约每 3 秒推一帧，默认 6 秒足够跨过一整个周期）",
+    )
     status.set_defaults(func=cmd_status)
 
     watch = sub.add_parser("watch", help="打印状态接口的原始字节，排查收不到广播")
@@ -423,7 +628,7 @@ def build_parser() -> argparse.ArgumentParser:
     watch.set_defaults(func=cmd_watch)
 
     battery = sub.add_parser("battery", help="只输出电量")
-    battery.add_argument("--timeout", type=float, default=2.0)
+    battery.add_argument("--timeout", type=float, default=6.0)
     battery.set_defaults(func=cmd_battery)
 
     get = sub.add_parser("get", help="读取寄存器并解码")
@@ -473,23 +678,112 @@ def build_parser() -> argparse.ArgumentParser:
     daemon_parser.add_argument("--preset", help="临时指定快照，覆盖本机预设")
     daemon_parser.add_argument("--interval", type=float, help="探测间隔（秒）")
     daemon_parser.add_argument("--once", action="store_true", help="只跑一轮，便于调试")
+    daemon_parser.add_argument("--hidden", action="store_true", help=argparse.SUPPRESS)
     daemon_parser.set_defaults(func=cmd_daemon)
 
     tray_parser = sub.add_parser("tray", help="托盘常驻版：显示电量、切换配置")
     tray_parser.add_argument("--preset", help="启动时使用的快照，覆盖本机预设")
     tray_parser.add_argument("--interval", type=float, help="电量刷新间隔（秒）")
+    tray_parser.add_argument("--hidden", action="store_true", help=argparse.SUPPRESS)
     tray_parser.set_defaults(func=cmd_tray)
 
     startup = sub.add_parser("startup", help="开机自启（Windows）")
     startup.add_argument("action", choices=["install", "uninstall", "status"])
+    startup.add_argument(
+        "--mode", choices=autostart.MODES, default="daemon",
+        help="install 时自启哪一种常驻：daemon=无界面守护（默认），tray=托盘版（带电量图标）",
+    )
     startup.set_defaults(func=cmd_startup)
 
     return parser
 
 
+_MENU = (
+    ("1", "配置向导", "采集当前配置 → 设为本机预设 → 装开机自启", ["setup"]),
+    ("2", "环境自检", "装不上 / 用不了，先跑它", ["doctor"]),
+    ("3", "查看状态", "电量 / DPI / 连接方式", ["status"]),
+    ("4", "托盘常驻", "后台运行，右下角图标看电量、右键切配置", ["tray"]),
+)
+
+
+def _pause(prompt: str = "按回车继续…") -> None:
+    try:
+        input(prompt)
+    except EOFError:
+        pass
+
+
+def _no_args() -> int:
+    """没带参数时（双击 exe 的典型情形）给一个菜单。
+
+    双击的用户不会去敲参数，所以这里不能只丢一堆 usage 就退出。
+    """
+    if not (sys.stdin is not None and sys.stdin.isatty()):
+        # 非交互（管道 / 重定向）：只打印用法，别把调用方卡住
+        print("rapoo-autoswitch —— 按电脑自动切换雷柏二代鼠标配置")
+        print()
+        print("常用：rapoo-autoswitch  setup / doctor / status / tray / daemon")
+        print()
+        build_parser().print_help()
+        return 0
+
+    while True:
+        print()
+        print("  rapoo-autoswitch —— 按电脑自动切换雷柏二代鼠标配置")
+        print()
+        for key, title, desc, _ in _MENU:
+            print(f"  {key}) {title:<8} {desc}")
+        print("  0) 退出")
+        print()
+        try:
+            choice = input("  请输入序号 [1]：").strip() or "1"
+        except EOFError:
+            # 输入流已经结束（句柄被关掉之类）：直接退出。这里**不能**退回默认值，
+            # 否则会在没人操作的情况下把「1) 配置向导」反复跑下去。
+            print()
+            return 0
+        if choice in ("0", "q", "quit", "exit"):
+            return 0
+        action = next((argv for key, _, _, argv in _MENU if key == choice), None)
+        if action is None:
+            print("  没有这个选项，重新选一下。")
+            continue
+        if action == ["tray"]:
+            # 托盘要长住后台：另起一个脱离控制台的进程去跑，菜单这边继续留着，
+            # 否则它会把本进程的控制台一起脱掉，菜单就看不见了。
+            print("  正在后台启动托盘…")
+            _spawn_detached(action)
+            _pause()
+            continue
+        try:
+            main(action)
+        except KeyboardInterrupt:
+            print()
+        _pause()
+
+
+def _make_stdout_safe() -> None:
+    """输出编码兜底。
+
+    中文 Windows 上，输出一旦被重定向（管道、写文件），Python 就用 GBK 编码，
+    遇到不能编码的字符会直接抛 ``UnicodeEncodeError`` 把命令打断。这里降级成
+    替换字符，保证命令不会因为一行输出而崩掉。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except Exception:  # noqa: BLE001 - 老版本/被包装过的流没有 reconfigure
+            pass
+
+
 def main(argv: Optional[List[str]] = None) -> int:
+    _make_stdout_safe()
+    raw = sys.argv[1:] if argv is None else argv
+    if not raw:
+        return _no_args()
+
     parser = build_parser()
-    args = parser.parse_args(argv or sys.argv[1:])
+    args = parser.parse_args(raw)
     try:
         return args.func(args)
     except (dev.DeviceError, FileNotFoundError, RuntimeError, ValueError) as exc:

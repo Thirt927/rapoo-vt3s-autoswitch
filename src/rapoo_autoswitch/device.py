@@ -152,6 +152,9 @@ class Session:
     def __init__(self, transport: Transport):
         self.transport = transport
         self._battery_cache: Optional[int] = None
+        self.profile_index = 0
+        """当前生效的板载配置组号（0 起）。系统寄存器都写进这一组。"""
+        self._profile_loaded = False
 
     # -- 生命周期 ---------------------------------------------------------
     def __enter__(self) -> "Session":
@@ -165,8 +168,42 @@ class Session:
         self.transport.write_control(p.build_unlock())
         time.sleep(self.SETTLE_S)
 
-    # -- 寄存器读写 -------------------------------------------------------
+    # -- 板载配置分组 -----------------------------------------------------
+    def load_profile(self) -> None:
+        """读厂家"当前生效的配置组"指针；读不到就沿用第 0 组。
+
+        设备把多份配置按每 4 个 bank 一组存在板载 Flash 里，**只有当前选中的
+        那一组真正生效**；写其他组同样能过回读校验，但鼠标行为纹丝不动——
+        这正是"下发成功却没生效"的根因。
+
+        只在真正读写系统寄存器时才调用（见 :meth:`_active_bank`）：`status`、
+        `watch` 这类只看状态广播的命令不必为它多付一次 HID 往返。
+        """
+        self._profile_loaded = True
+        try:
+            raw = self._read_raw(p.BANK_PROFILE_INFO, p.ADDR_ACTIVE_PROFILE, 1)
+        except DeviceError:
+            return
+        if raw:
+            self.profile_index = raw[0]
+
+    def _active_bank(self, bank: int) -> int:
+        """把"第 0 组的逻辑系统银行"映射到当前生效那一组。"""
+        if bank != p.BANK_SYSTEM:
+            return bank
+        if not self._profile_loaded:
+            self.load_profile()
+        return p.system_bank_for(self.profile_index)
+
+    # -- 寄存器读写（对外，自动落到当前生效的配置组）----------------------
     def read_raw(self, bank: int, addr: int, length: int) -> bytes:
+        return self._read_raw(self._active_bank(bank), addr, length)
+
+    def write_raw(self, bank: int, addr: int, data: bytes) -> None:
+        self._write_raw(self._active_bank(bank), addr, data)
+
+    # -- 原始读写（bank 原样，不做组映射）----------------------------------
+    def _read_raw(self, bank: int, addr: int, length: int) -> bytes:
         last_error: Optional[str] = None
         for _ in range(self.RETRIES):
             self.transport.write_control(p.build_read(bank, addr, length))
@@ -182,7 +219,7 @@ class Session:
             f"读取 0x{bank:02x}/0x{addr:02x} 失败（{last_error or '应答超时'}）"
         )
 
-    def write_raw(self, bank: int, addr: int, data: bytes) -> None:
+    def _write_raw(self, bank: int, addr: int, data: bytes) -> None:
         """写寄存器并**回读校验**。
 
         注意：真机不会在 Feature 接口回显刚写入的数据——写命令只回一个 ACK，其后
@@ -195,7 +232,7 @@ class Session:
             self.transport.write_control(p.build_write(bank, addr, data))
             time.sleep(self.SETTLE_S)
             try:
-                last = self.read_raw(bank, addr, len(data))
+                last = self._read_raw(bank, addr, len(data))
             except DeviceError:
                 continue
             if last == data:
