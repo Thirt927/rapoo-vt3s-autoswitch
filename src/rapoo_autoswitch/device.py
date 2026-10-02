@@ -183,24 +183,26 @@ class Session:
         )
 
     def write_raw(self, bank: int, addr: int, data: bytes) -> None:
+        """写寄存器并**回读校验**。
+
+        注意：真机不会在 Feature 接口回显刚写入的数据——写命令只回一个 ACK，其后
+        跟着零字节。因此校验必须靠"重新读一次该寄存器"，绝不能拿写命令的应答当结果
+        （那样每次校验都会失败，而设备其实写成功了）。
+        """
         data = bytes(data)
+        last: Optional[bytes] = None
         for _ in range(self.RETRIES):
             self.transport.write_control(p.build_write(bank, addr, data))
             time.sleep(self.SETTLE_S)
             try:
-                back = p.parse_feature_read(self.transport.get_feature(), len(data))
-            except Exception:  # noqa: BLE001
-                back = None
-            if back is None:
-                # 部分机型写命令不走 Feature 应答，回读一次确认
-                try:
-                    back = self.read_raw(bank, addr, len(data))
-                except DeviceError:
-                    continue
-            if back == data:
+                last = self.read_raw(bank, addr, len(data))
+            except DeviceError:
+                continue
+            if last == data:
                 return
         raise DeviceError(
-            f"写入 0x{bank:02x}/0x{addr:02x} 校验失败：期望 {data.hex()}，回读 {back.hex() if back else '无'}"
+            f"写入 0x{bank:02x}/0x{addr:02x} 校验失败："
+            f"期望 {data.hex()}，回读 {last.hex() if last else '无应答'}"
         )
 
     def read_register(self, reg: p.Register) -> bytes:

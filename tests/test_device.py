@@ -175,3 +175,22 @@ def test_vt3s_v2_pid_is_recognised():
     from rapoo_autoswitch.device import DeviceInfo
 
     assert DeviceInfo(product_id=0x1464, product_string="Rapoo Gaming Device").model == "雷柏 VT3S V2"
+
+
+# --- dump：整段读取，用于对比不同配置 ---------------------------------------
+def test_cmd_dump_prints_address_rows(monkeypatch, capsys):
+    from fakes import FakeTransport
+
+    from rapoo_autoswitch import protocol as p
+    from rapoo_autoswitch.device import DeviceInfo, Session
+
+    transport = FakeTransport({(p.BANK_SYSTEM, 0x80): b"\x82"})
+    session = Session(transport)
+    monkeypatch.setattr(cli, "_open_session", lambda vid: (DeviceInfo(0x1464, "x"), session))
+
+    args = cli.build_parser().parse_args(["dump", "0x08", "0x80", "0x81", "--chunk", "2"])
+    assert cli.cmd_dump(args) == 0
+
+    out = capsys.readouterr().out
+    assert "bank 0x08" in out
+    assert "80: 82 00" in out  # 0x80 有值，0x81 未设置读回 0

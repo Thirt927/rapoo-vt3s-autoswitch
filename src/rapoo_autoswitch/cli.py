@@ -190,6 +190,39 @@ def cmd_dpi(args) -> int:
     return 0
 
 
+def cmd_dump(args) -> int:
+    """把一段地址整体读出来逐行打印，用于对比不同配置的差异。
+
+    典型用法——定位 A-Hub 两套配置到底差在哪::
+
+        rapoo-autoswitch dump 0x08 > 出厂.txt
+        （在 A-Hub 里切到另一套配置）
+        rapoo-autoswitch dump 0x08 > 办公.txt
+        fc 出厂.txt 办公.txt
+    """
+    _, session = _open_session(args.vendor_id)
+    rows = []
+    with session:
+        addr = args.start
+        while addr <= args.end:
+            length = min(args.chunk, args.end - addr + 1, p.MAX_PAYLOAD)
+            if length <= 0:
+                break
+            try:
+                rows.append((addr, session.read_raw(args.bank, addr, length)))
+            except dev.DeviceError as exc:
+                rows.append((addr, f"<读取失败: {exc}>"))
+            addr += length
+
+    print(f"# bank 0x{args.bank:02x}  addr 0x{args.start:02x}..0x{args.end:02x}")
+    for addr, raw in rows:
+        if isinstance(raw, str):
+            print(f"{addr:02x}: {raw}")
+        else:
+            print(f"{addr:02x}: {raw.hex(' ')}")
+    return 0
+
+
 def cmd_probe(args) -> int:
     """原始读取，用于逆向新机型/新寄存器。"""
     _, session = _open_session(args.vendor_id)
@@ -353,6 +386,13 @@ def build_parser() -> argparse.ArgumentParser:
     dpi.add_argument("stages", nargs="?", help="各档 DPI，如 800,1600,3200")
     dpi.add_argument("--index", type=int, help="切换当前档位（1 起）")
     dpi.set_defaults(func=cmd_dpi)
+
+    dump = sub.add_parser("dump", help="整段读出寄存器，用于对比不同配置的差异")
+    dump.add_argument("bank", nargs="?", type=lambda v: int(v, 0), default=p.BANK_SYSTEM)
+    dump.add_argument("start", nargs="?", type=lambda v: int(v, 0), default=0x00)
+    dump.add_argument("end", nargs="?", type=lambda v: int(v, 0), default=0xFF)
+    dump.add_argument("--chunk", type=lambda v: int(v, 0), default=16, help="单帧读取长度，默认 16")
+    dump.set_defaults(func=cmd_dump)
 
     probe = sub.add_parser("probe", help="原始读取，用于逆向新机型")
     probe.add_argument("bank", type=lambda v: int(v, 0))

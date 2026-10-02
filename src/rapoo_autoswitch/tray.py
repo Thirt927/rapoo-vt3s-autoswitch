@@ -199,8 +199,12 @@ class TrayApp:
                     with dev.open_session(found) as session:
                         report = session.wait_status(timeout_s=1.5)
                         if attached is None and self.preset:
-                            written = profiles.apply(session, profiles.load(self.preset))
-                            log.info("接入自动下发「%s」：%d 项", self.preset, len(written))
+                            try:
+                                written = profiles.apply(session, profiles.load(self.preset))
+                                log.info("接入自动下发「%s」：%d 项", self.preset, len(written))
+                            except Exception as exc:  # noqa: BLE001
+                                log.error("自动下发「%s」失败：%s", self.preset, exc)
+                                self._note = f"下发失败：{exc}"
                 except Exception as exc:  # noqa: BLE001
                     log.error("读取状态失败：%s", exc)
 

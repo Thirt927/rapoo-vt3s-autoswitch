@@ -97,6 +97,18 @@ def test_session_reads_status_and_caches_battery():
     assert report is not None and report.battery == 42
 
 
+def test_write_verifies_by_rereading_not_by_write_echo():
+    """回归：真机写命令只回 ACK + 零字节，不能拿写应答当校验结果。
+
+    ``FakeTransport`` 已按真机行为实现（写命令不回显刚写的数据），所以这条能过
+    就说明 ``write_raw`` 走的是"重新读一次该寄存器"这条正确的校验路径。
+    """
+    session = make_session({})
+    snapshot = profiles.Snapshot(name="x", product_id=1, registers={"08:80": "01"})
+    assert profiles.apply(session, snapshot) == ["08:80"]
+    assert session.transport.registers[(p.BANK_SYSTEM, 0x80)] == b"\x01"
+
+
 def test_missing_snapshot_raises():
     with pytest.raises(FileNotFoundError):
         profiles.load("不存在")

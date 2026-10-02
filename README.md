@@ -132,6 +132,7 @@ rapoo-autoswitch startup install
 | `dpi` | 查看各档 DPI；`dpi 800,1600,3200` 设置，`dpi --index 2` 切当前档位 |
 | `get [寄存器...]` | 读取寄存器并解码显示 |
 | `set 寄存器=值 ...` | 写入寄存器并回读校验 |
+| `dump [bank] [start] [end]` | 整段读出寄存器逐行打印，用于对比不同配置的差异 |
 | `probe <bank> <addr> <len>` | 原始字节读取，用于逆向新机型 |
 | `snapshot <名字>` | 把当前配置采集为快照 |
 | `snapshots` | 列出本机所有快照，标出当前预设 |
@@ -177,7 +178,7 @@ src/rapoo_autoswitch/
   tray.py        托盘常驻版（电量图标 + 切换配置菜单）
   autostart.py   Windows 开机自启
   cli.py         命令行入口
-tests/           55 个用例，全部不需要硬件
+tests/           61 个用例，全部不需要硬件
 docs/PROTOCOL.md 逆向出的协议细节与来源
 ```
 

@@ -45,7 +45,10 @@ class FakeTransport:
         elif command == p.CMD_WRITE:
             data = frame[8:8 + length]
             self.registers[key] = bytearray(data)
-            self._last_feature = self._feature(bytes(data))
+            # 真机不会回显写入的数据：写命令只回一个 ACK，其后跟零字节。
+            # 这里必须照实现，否则会掩盖"误把写应答当校验结果"这类 bug
+            # （真机上表现为每次写入都校验失败，虽然设备其实写成功了）。
+            self._last_feature = self._feature(bytes(length))
 
     def get_feature(self, length: int = 33) -> bytes:
         return self._last_feature.ljust(length, b"\x00")[:length]
