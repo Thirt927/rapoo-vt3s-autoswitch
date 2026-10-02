@@ -115,3 +115,63 @@ def test_require_hidapi_reports_hint_and_underlying_error(monkeypatch):
     message = str(excinfo.value)
     assert "pip install hidapi" in message
     assert "找不到 hidapi.dll" in message
+
+
+# --- 接口打开：open_path 的返回值语义 ---------------------------------------
+WINDOWS_PATH = (
+    b"\\\\?\\HID#VID_24AE&PID_1464&MI_01&Col05#7&be251db&0&0004"
+    b"#{4d1e55b2-f16f-11cf-88cb-001111000030}"
+)
+
+
+class _FakeHidModule:
+    """替身 hid 模块，只提供 device()。"""
+
+    def __init__(self, device):
+        self._device = device
+
+    def device(self):
+        return self._device
+
+
+class _OkDevice:
+    def __init__(self):
+        self.opened = []
+
+    def open_path(self, path):
+        self.opened.append(path)
+        return None  # cython-hidapi 成功时就是返回 None
+
+
+class _FailDevice:
+    def open_path(self, path):
+        raise OSError("Unable to open device")
+
+
+def test_open_path_treats_none_return_as_success(monkeypatch):
+    """回归：曾把 open_path 的 None 返回值当成失败，导致设备永远打不开。"""
+    device = _OkDevice()
+    monkeypatch.setattr(transport, "_hidapi", _FakeHidModule(device))
+    assert transport.HidapiTransport._open(WINDOWS_PATH) is device
+    assert device.opened == [WINDOWS_PATH]
+
+
+def test_open_path_failure_gives_readable_error(monkeypatch):
+    monkeypatch.setattr(transport, "_hidapi", _FakeHidModule(_FailDevice()))
+    with pytest.raises(RuntimeError) as excinfo:
+        transport.HidapiTransport._open(WINDOWS_PATH)
+    message = str(excinfo.value)
+    assert "VID_24AE&PID_1464&MI_01&Col05" in message  # 可读片段，不是整条长路径
+    assert "Unable to open device" in message
+    assert "A-Hub" in message  # 提示独占占用的常见原因
+
+
+def test_short_path_compresses_windows_device_path():
+    assert transport.short_path(WINDOWS_PATH) == "VID_24AE&PID_1464&MI_01&Col05"
+    assert transport.short_path("/dev/hidraw3") == "/dev/hidraw3"
+
+
+def test_vt3s_v2_pid_is_recognised():
+    from rapoo_autoswitch.device import DeviceInfo
+
+    assert DeviceInfo(product_id=0x1464, product_string="Rapoo Gaming Device").model == "雷柏 VT3S V2"

@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Optional
 
 from .protocol import RID_FEATURE
@@ -54,6 +55,20 @@ def require_hidapi() -> None:
     raise RuntimeError(f"未找到可用的 HID 通信库。\n{INSTALL_HINT}{detail}")
 
 
+def short_path(path) -> str:
+    """把 Windows 设备路径压成可读片段。
+
+    原始路径长这样::
+
+        \\\\?\\HID#VID_24AE&PID_1464&MI_01&Col05#7&be251db&0&0004#{guid}
+
+    报错时只需要 ``VID_24AE&PID_1464&MI_01&Col05`` 就够定位了。
+    """
+    text = path.decode("utf-8", "replace") if isinstance(path, (bytes, bytearray)) else str(path)
+    match = re.search(r"VID_[0-9A-Fa-f]{4}&PID_[0-9A-Fa-f]{4}&MI_\d+&Col\d+", text)
+    return match.group(0) if match else text
+
+
 class Transport:
     """一次设备连接的字节通道。"""
 
@@ -81,9 +96,19 @@ class HidapiTransport(Transport):
 
     @staticmethod
     def _open(path):
+        """打开一个接口。
+
+        ``cython-hidapi`` 的 ``open_path`` **成功时返回 None、失败时抛 IOError**，
+        所以不能拿返回值当布尔判断——那会把"成功"判成"失败"，导致永远打不开设备。
+        """
         device = _hidapi.device()
-        if not device.open_path(path):
-            raise RuntimeError(f"无法打开 HID 接口: {path!r}")
+        try:
+            device.open_path(path)
+        except Exception as exc:  # noqa: BLE001 - 统一成带上下文的错误
+            raise RuntimeError(
+                f"无法打开 HID 接口 {short_path(path)}：{exc}\n"
+                "常见原因：官方 A-Hub 等驱动正以独占方式占用该接口，退出它们后重试。"
+            ) from exc
         return device
 
     def write_control(self, frame: bytes) -> None:
