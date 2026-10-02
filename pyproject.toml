@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,21 +8,21 @@ version = "0.1.0"
 description = "按电脑自动切换雷柏二代鼠标（VT3S V2 等）配置的命令行工具与后台守护"
 readme = "README.md"
 requires-python = ">=3.9"
-license = { text = "MIT" }
+license = "MIT"
 authors = [{ name = "rapoo-vt3s-autoswitch contributors" }]
 keywords = ["rapoo", "vt3s", "hid", "mouse", "profile", "autoswitch"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Win32 (MS Windows)",
     "Intended Audience :: End Users/Desktop",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Topic :: System :: Hardware :: Hardware Drivers",
 ]
 
-# 硬件通信依赖 hidapi 的 Python 绑定；仅在真正连鼠标的机器上需要，
-# 纯逻辑与单元测试不需要它。
-dependencies = ["hid>=0.14"]
+# 必须装 hidapi（trezor/cython-hidapi），不要装 hid（apmorton/pyhidapi）：
+# 两者都提供 import hid，但后者只是 ctypes 绑定、不含原生库，
+# 在 Windows 上会因找不到 hidapi.dll 而导入失败。
+dependencies = ["hidapi>=0.14"]
 
 [project.optional-dependencies]
 tray = ["pystray>=0.19", "Pillow>=10"]

@@ -2,7 +2,7 @@
 
 import pytest
 
-from rapoo_autoswitch import cli
+from rapoo_autoswitch import cli, transport
 from rapoo_autoswitch.device import (
     USAGE_CONTROL,
     USAGE_FEATURE,
@@ -93,3 +93,25 @@ def test_cli_current_shows_machine(capsys):
 def test_cli_use_requires_existing_snapshot(capsys):
     assert cli.main(["use", "不存在的预设"]) == 2
     assert "错误" in capsys.readouterr().err
+
+
+# --- HID 后端：装错包是最常见的坑 -------------------------------------------
+def test_install_hint_names_the_right_package():
+    """两个包都提供 import hid，提示必须指明该装哪个、该卸哪个。"""
+    assert "pip install hidapi" in transport.INSTALL_HINT
+    assert "pip uninstall -y hid" in transport.INSTALL_HINT
+
+
+def test_require_hidapi_passes_when_backend_present(monkeypatch):
+    monkeypatch.setattr(transport, "_hidapi", object())
+    transport.require_hidapi()  # 不抛异常即通过
+
+
+def test_require_hidapi_reports_hint_and_underlying_error(monkeypatch):
+    monkeypatch.setattr(transport, "_hidapi", None)
+    monkeypatch.setattr(transport, "_HID_IMPORT_ERROR", OSError("找不到 hidapi.dll"))
+    with pytest.raises(RuntimeError) as excinfo:
+        transport.require_hidapi()
+    message = str(excinfo.value)
+    assert "pip install hidapi" in message
+    assert "找不到 hidapi.dll" in message

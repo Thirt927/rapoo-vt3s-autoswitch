@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 from . import protocol as p
-from .transport import HidapiTransport, Transport, hidapi_available
+from .transport import HidapiTransport, Transport, require_hidapi
 
 VENDOR_USAGE_PAGE = 0xFF00
 USAGE_CONTROL = 0x000E
@@ -106,8 +106,7 @@ def _assign_roles(infos: List[dict]) -> Dict[str, object]:
 
 def enumerate_devices(vendor_id: int = p.VENDOR_ID) -> List[DeviceInfo]:
     """枚举当前连接的雷柏二代鼠标。"""
-    if not hidapi_available():
-        raise RuntimeError("未安装 hidapi 绑定（pip install hid），无法枚举设备")
+    require_hidapi()
     import hid  # 局部 import，避免离线环境硬依赖
 
     grouped: Dict[int, List[dict]] = {}

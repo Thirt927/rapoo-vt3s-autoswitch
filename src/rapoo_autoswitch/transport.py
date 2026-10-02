@@ -1,10 +1,17 @@
 """HID 传输层。
 
-真实实现基于 ``hidapi``（PyPI 包名 ``hid``）：雷柏二代会暴露三个 HID 接口，
-分别负责下发命令、读回 Feature 应答、接收状态广播，因此 :class:`HidapiTransport`
-同时持有三个句柄。
+真实实现基于 hidapi：雷柏二代会暴露三个 HID 接口，分别负责下发命令、读回 Feature
+应答、接收状态广播，因此 :class:`HidapiTransport` 同时持有三个句柄。
 
-``hid`` 是可选依赖：只做离线逻辑/单元测试的机器不装它也能 import 本模块。
+**依赖要点**：PyPI 上提供 ``import hid`` 的包有两个，必须选对——
+
+* ``hidapi``（trezor/cython-hidapi）—— 编译扩展，原生库静态链接，装完即用 ✅
+* ``hid``（apmorton/pyhidapi）—— 只是 ctypes 绑定，**不含原生库**，Windows 上会因找不到
+  ``hidapi.dll`` 而在导入时失败 ❌
+
+两者提供的模块名都是 ``hid``、API 也一致，因此本项目统一依赖 ``hidapi``。
+
+``hid`` 属于必装依赖，但为了能在离线环境跑单元测试，这里仍做导入降级处理。
 """
 
 from __future__ import annotations
@@ -13,15 +20,38 @@ from typing import Optional
 
 from .protocol import RID_FEATURE
 
+_HID_IMPORT_ERROR: Optional[BaseException] = None
 try:  # pragma: no cover - 取决于运行环境
     import hid as _hidapi
-except Exception:  # noqa: BLE001 - hidapi 缺失或底层库加载失败都要降级
+except Exception as _exc:  # noqa: BLE001 - 缺库或原生库加载失败都要降级
     _hidapi = None  # type: ignore[assignment]
+    _HID_IMPORT_ERROR = _exc
+
+INSTALL_HINT = (
+    "请安装带原生库的 HID 绑定：pip install hidapi\n"
+    "若已装过 hid（apmorton/pyhidapi），请先卸载它——它只是 ctypes 绑定、不含原生库，\n"
+    "在 Windows 上会因找不到 hidapi.dll 而导入失败：pip uninstall -y hid"
+)
 
 
 def hidapi_available() -> bool:
     """当前环境是否能真正访问 HID 设备。"""
     return _hidapi is not None
+
+
+def import_error() -> Optional[BaseException]:
+    """导入 hid 失败时抛出的原始异常，便于排查（成功时为 None）。"""
+    return _HID_IMPORT_ERROR
+
+
+def require_hidapi() -> None:
+    """确保 HID 后端可用，否则抛出带安装指引的异常。"""
+    if _hidapi is not None:
+        return
+    detail = ""
+    if _HID_IMPORT_ERROR is not None:
+        detail = f"\n底层错误：{type(_HID_IMPORT_ERROR).__name__}: {_HID_IMPORT_ERROR}"
+    raise RuntimeError(f"未找到可用的 HID 通信库。\n{INSTALL_HINT}{detail}")
 
 
 class Transport:
@@ -44,10 +74,7 @@ class HidapiTransport(Transport):
     """基于 hidapi 的三接口实现。"""
 
     def __init__(self, control_path, feature_path, status_path=None):
-        if _hidapi is None:
-            raise RuntimeError(
-                "未安装 hidapi 绑定，无法连接鼠标。请先执行: pip install hid"
-            )
+        require_hidapi()
         self._control = self._open(control_path)
         self._feature = self._open(feature_path)
         self._status = self._open(status_path) if status_path else None

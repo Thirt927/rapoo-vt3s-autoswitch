@@ -45,18 +45,57 @@
 
 ## 安装
 
+### Windows 逐步安装
+
+1. **装 Python 3.9+**：从 https://www.python.org/downloads/ 下载，安装时**务必勾选
+   `Add python.exe to PATH`**（漏了后面会提示找不到 pip）。装完重开一个终端。
+2. **把项目弄到本地**：在 https://github.com/Thirt927/rapoo-vt3s-autoswitch 点绿色
+   `Code` → `Download ZIP`，解压到纯英文路径，例如 `D:\rapoo-vt3s-autoswitch`
+   （也可以 `git clone`）。
+3. **进到项目目录**：资源管理器进入该目录，在地址栏输入 `cmd` 回车；这样终端就已经
+   定位在项目文件夹里了。
+4. **安装**：
+
 ```bash
 pip install -e .
 ```
 
-真实读写需要 hidapi 的 Python 绑定（`pip install hid`，已列为依赖）。只跑测试或离线看
-命令帮助则不需要。
+`-e` 是可编辑模式（改代码立即生效），`.` 表示"当前目录"——所以第 3 步必须先 `cd` 进来。
 
-想要托盘常驻版，再装可选依赖：
+5. **想要托盘常驻版**，再装可选依赖：
 
 ```bash
 pip install -e ".[tray]"     # pystray + Pillow
 ```
+
+6. **验证**：插上鼠标，执行 `rapoo-autoswitch list`，能列出三个接口即成功。
+
+> 全程不需要管理员权限。
+
+### ⚠️ 最常见的坑：`hid` 和 `hidapi` 是两个不同的包
+
+PyPI 上**两个包都提供 `import hid`**，但只有一个能用：
+
+| 包 | 说明 |
+| --- | --- |
+| **`hidapi`**（trezor/cython-hidapi） | 编译扩展，原生库**静态链接**，装完即用 ✅ 本项目依赖它 |
+| `hid`（apmorton/pyhidapi） | 只是 ctypes 绑定，**不含原生库**，Windows 上会因找不到 `hidapi.dll` 而在导入时失败 ❌ |
+
+如果你之前装过 `hid`，会看到"未安装 hidapi 绑定"这类报错，即使 pip 说依赖已满足。解决：
+
+```bash
+pip uninstall -y hid
+pip install hidapi
+```
+
+### 常见报错
+
+| 报错 | 原因与解法 |
+| --- | --- |
+| `'pip' 不是内部或外部命令` | Python 没加进 PATH，改用 `py -m pip install -e .` |
+| `'rapoo-autoswitch' 不是内部或外部命令` | 装好了但 Scripts 目录不在 PATH，改用 `py -m rapoo_autoswitch list` |
+| `error in 'egg_base' option: 'src' does not exist` | 项目文件不完整（多为下载/解压不全），重新完整下载 |
+| `未找到可用的 HID 通信库` | 见上方 `hid` / `hidapi` 一节 |
 
 ## 快速开始
 
@@ -138,7 +177,7 @@ src/rapoo_autoswitch/
   tray.py        托盘常驻版（电量图标 + 切换配置菜单）
   autostart.py   Windows 开机自启
   cli.py         命令行入口
-tests/           52 个用例，全部不需要硬件
+tests/           55 个用例，全部不需要硬件
 docs/PROTOCOL.md 逆向出的协议细节与来源
 ```
 
