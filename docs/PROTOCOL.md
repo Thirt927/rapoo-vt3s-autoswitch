@@ -216,12 +216,14 @@ rapoo-tray / ClickSync 的 `BUTTON_ADDR` 与 `keymapAction` 继续探索。
 
 *来源：rapoo-tray `ParseStatusReport`（MIT）。*
 
-## 8. 机型 PID（已实测）
+## 8. 机型 PID
 
 | PID | 型号 | 连接 |
 | --- | --- | --- |
 | `1406` / `1410` / `1411` | VT3S | 2.4G |
 | `4606` / `4611` | VT3S | 有线 |
+| `1464` | VT3S V2 | 2.4G |
+| `4664` | VT3S V2 | 有线（推断，未实测） |
 | `1460` / `4660` | VT7 | 2.4G / 有线 |
 | `1412` / `4612` | VT3 / VT3 | 2.4G / 有线 |
 | `1417` / `4617` | VT3 MAX | 2.4G / 有线 |
@@ -229,11 +231,14 @@ rapoo-tray / ClickSync 的 `BUTTON_ADDR` 与 `keymapAction` 继续探索。
 规律（**未验证**）：有线机型 PID 以 `46` 开头。本项目据此推断"有线 / 2.4G"，
 并以状态广播里的设备标记为准。
 
-*来源：rapoo-tray `VERIFIED_MODELS`（MIT，均标注"实测已验证"）。*
+*来源：`1406/1410/1411/4606/4611/1460/4660/1412/4612/1417/4617` 取自 rapoo-tray
+`VERIFIED_MODELS`（MIT，标注"实测已验证"）；`1464` 为本项目在 VT3S V2 真机上确认，
+`4664` 按上述规律推得。*
 
-## 9. VT3S V2 验证清单
+## 9. 机型验证清单
 
-拿到真机后，建议按顺序确认并把结论回填到本文与 `protocol.SYSTEM_REGISTERS`：
+换到一只尚未收录的机型时，建议按顺序走一遍，并把结论回填到本文与
+`protocol.SYSTEM_REGISTERS`（本文其余各节记录的，就是在 VT3S V2 上这样确认出来的结果）：
 
 1. `rapoo-autoswitch list` —— 确认三个接口都被正确识别为 control/feature/status，
    记录实际 PID 与产品名；
