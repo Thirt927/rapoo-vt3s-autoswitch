@@ -45,6 +45,21 @@ BANK_BUTTON = 0x06
 BANK_SYSTEM = 0x08
 """系统设置银行：DPI、回报率、休眠、LOD 等都在这里。"""
 
+# --- DPI 相关寄存器地址（bank 0x08）----------------------------------------
+ADDR_DPI_TABLE_X = 0x88
+ADDR_DPI_TABLE_Y = 0xC8
+ADDR_DPI_SLOT_COUNT = 0x96
+ADDR_DPI_ACTIVE_INDEX = 0x98
+
+DPI_MAX_SLOTS = 6
+"""最多 6 档 DPI。"""
+
+DPI_TABLE_BYTES = DPI_MAX_SLOTS * 2
+"""DPI 表的完整读取长度：6 档 × u16。"""
+
+DPI_SLOT_COUNT_KEY = f"{BANK_SYSTEM:02x}:{ADDR_DPI_SLOT_COUNT:02x}"
+"""快照里档位数寄存器的键，下发 DPI 表时要用它决定表长。"""
+
 
 # --------------------------------------------------------------------------
 # 报文构造
@@ -182,8 +197,11 @@ class Register:
     name: str
     length: int = 1
     kind: str = "byte"
-    """取值语义：``byte`` / ``polling`` / ``bool`` / ``minutes`` / ``angle``。"""
+    """取值语义：``byte`` / ``polling`` / ``bool`` / ``minutes`` / ``angle`` /
+    ``dpi_table`` / ``slot_count`` / ``dpi_index``。"""
     help: str = ""
+    order: int = 100
+    """下发顺序，小的先写。协议有依赖关系时必须显式指定。"""
 
     @property
     def key(self) -> str:
@@ -191,6 +209,11 @@ class Register:
         return f"{self.bank:02x}:{self.addr:02x}"
 
     def decode(self, raw: bytes) -> object:
+        if self.kind == "dpi_table":
+            return [
+                int.from_bytes(raw[i * 2:i * 2 + 2], "little")
+                for i in range(len(raw) // 2)
+            ]
         value = raw[0] if self.length == 1 else raw
         if self.kind == "polling":
             return POLLING_CODE_TO_HZ.get(value, value)
@@ -198,9 +221,20 @@ class Register:
             return bool(value)
         if self.kind == "angle":
             return int.from_bytes(bytes([value]), "little", signed=True)
+        if self.kind == "slot_count":
+            # 协议码 = 档位数 - 1
+            return min(value + 1, DPI_MAX_SLOTS)
+        if self.kind == "dpi_index":
+            # 显示用的 1 起档位号
+            return value + 1
         return value
 
     def encode(self, value) -> bytes:
+        if self.kind == "dpi_table":
+            values = value
+            if isinstance(value, str):
+                values = [int(part) for part in value.replace(",", " ").split()]
+            return b"".join(int(v).to_bytes(2, "little") for v in values)
         if self.kind == "polling":
             hz = int(value)
             if hz not in POLLING_HZ_TO_CODE:
@@ -208,6 +242,9 @@ class Register:
             value = POLLING_HZ_TO_CODE[hz]
         elif self.kind == "bool":
             value = 1 if value else 0
+        elif self.kind in ("slot_count", "dpi_index"):
+            # 对外是 1 起，落盘是 0 起的协议码 / 索引
+            value = int(value) - 1
         if self.length == 1:
             return bytes([int(value) & 0xFF])
         return int(value).to_bytes(self.length, "little", signed=self.kind == "angle")
@@ -226,16 +263,49 @@ POLLING_CODE_TO_HZ: Dict[int, int] = {v: k for k, v in POLLING_HZ_TO_CODE.items(
 
 
 SYSTEM_REGISTERS: List[Register] = [
-    Register(BANK_SYSTEM, 0x80, "polling_hz", kind="polling", help="回报率（Link 相关）"),
-    Register(BANK_SYSTEM, 0x81, "key_scan_rate", help="按键扫描率"),
-    Register(BANK_SYSTEM, 0x84, "lod", help="抬升高度（LOD）档位"),
-    Register(BANK_SYSTEM, 0x85, "motion_sync", kind="bool", help="移动同步"),
-    Register(BANK_SYSTEM, 0xC2, "sleep_minutes", kind="minutes", help="休眠时间（2..120 分钟）"),
-    Register(BANK_SYSTEM, 0xC3, "linear_ripple", help="直线修正 / 波纹控制标志位"),
-    Register(BANK_SYSTEM, 0xC4, "sensor_angle", kind="angle", help="传感器角度（有符号）"),
-    Register(BANK_SYSTEM, 0xC5, "glass_mode", kind="bool", help="玻璃模式"),
+    # --- DPI：协议要求先写两张表，再写档位数，最后写当前档位 ---
+    Register(
+        BANK_SYSTEM, ADDR_DPI_TABLE_X, "dpi_table_x", length=DPI_TABLE_BYTES,
+        kind="dpi_table", order=10, help="X 轴各档 DPI（u16le × 档位数）",
+    ),
+    Register(
+        BANK_SYSTEM, ADDR_DPI_TABLE_Y, "dpi_table_y", length=DPI_TABLE_BYTES,
+        kind="dpi_table", order=11, help="Y 轴各档 DPI（u16le × 档位数）",
+    ),
+    Register(
+        BANK_SYSTEM, ADDR_DPI_SLOT_COUNT, "dpi_slot_count", kind="slot_count",
+        order=20, help="启用的 DPI 档位数（1..6）",
+    ),
+    Register(
+        BANK_SYSTEM, ADDR_DPI_ACTIVE_INDEX, "dpi_active_index", kind="dpi_index",
+        order=21, help="当前生效的档位（1..档位数）",
+    ),
+    # --- 性能与时间 ---
+    Register(BANK_SYSTEM, 0x80, "polling_hz", kind="polling", order=40, help="回报率"),
+    Register(BANK_SYSTEM, 0x81, "key_scan_rate", order=41, help="按键扫描率"),
+    Register(BANK_SYSTEM, 0x84, "lod", order=42, help="抬升高度（LOD）档位"),
+    Register(BANK_SYSTEM, 0x85, "motion_sync", kind="bool", order=43, help="移动同步"),
+    Register(BANK_SYSTEM, 0xC0, "debounce_ms", order=44, help="按键消抖时间"),
+    Register(BANK_SYSTEM, 0xC1, "lift_delay_ms", order=45, help="抬起延迟"),
+    Register(
+        BANK_SYSTEM, 0xC2, "sleep_minutes", kind="minutes", order=46,
+        help="休眠时间（2..120 分钟）",
+    ),
+    Register(
+        BANK_SYSTEM, 0xC3, "linear_ripple", order=47,
+        help="bit0 直线修正、bit1 波纹控制（0=开启）",
+    ),
+    Register(BANK_SYSTEM, 0xC4, "sensor_angle", kind="angle", order=48, help="传感器角度"),
+    Register(BANK_SYSTEM, 0xC5, "glass_mode", kind="bool", order=49, help="玻璃模式"),
 ]
-"""已确认语义的系统寄存器。**未实测机型请先 ``probe`` 再写入。**"""
+"""快照默认覆盖的系统寄存器。
+
+下发时会按 ``Register.order`` 排序，保证 DPI 表先于档位数/当前档位写入。
+未实测机型请先 ``probe`` 确认后再写入。
+"""
 
 REGISTRY: Dict[str, Register] = {r.name: r for r in SYSTEM_REGISTERS}
 """按名字索引，供 CLI 使用。"""
+
+REGISTRY_BY_KEY: Dict[str, Register] = {r.key: r for r in SYSTEM_REGISTERS}
+"""按 ``"bank:addr"`` 索引，供快照下发时查顺序与类型。"""

@@ -123,3 +123,34 @@ def test_register_keys_are_stable():
     reg = p.REGISTRY["polling_hz"]
     assert reg.key == "08:80"
     assert reg.bank == p.BANK_SYSTEM
+
+
+# --- DPI 寄存器 -----------------------------------------------------------
+def test_dpi_slot_count_is_stored_as_code():
+    reg = p.REGISTRY["dpi_slot_count"]
+    assert reg.decode(b"\x02") == 3          # 协议码 2 = 3 档
+    assert reg.encode(3) == b"\x02"
+    assert reg.decode(b"\xff") == p.DPI_MAX_SLOTS  # 越界值被夹住
+
+
+def test_dpi_active_index_is_one_based_outside():
+    reg = p.REGISTRY["dpi_active_index"]
+    assert reg.decode(b"\x00") == 1
+    assert reg.encode(2) == b"\x01"
+
+
+def test_dpi_table_decode_and_encode():
+    reg = p.REGISTRY["dpi_table_x"]
+    assert reg.length == p.DPI_TABLE_BYTES == 12
+    assert reg.decode(bytes.fromhex("20034006")) == [800, 1600]
+    assert reg.encode([800, 1600]) == bytes.fromhex("20034006")
+    assert reg.encode("800,1600") == bytes.fromhex("20034006")
+
+
+def test_dpi_registers_declare_write_order():
+    """协议依赖：两张表必须早于档位数，档位数早于当前档位。"""
+    assert p.REGISTRY["dpi_table_x"].order < p.REGISTRY["dpi_slot_count"].order
+    assert p.REGISTRY["dpi_table_y"].order < p.REGISTRY["dpi_slot_count"].order
+    assert p.REGISTRY["dpi_slot_count"].order < p.REGISTRY["dpi_active_index"].order
+    assert p.REGISTRY_BY_KEY["08:88"].name == "dpi_table_x"
+    assert p.DPI_SLOT_COUNT_KEY == "08:96"

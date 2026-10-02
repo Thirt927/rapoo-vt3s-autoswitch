@@ -25,6 +25,7 @@ classifiers = [
 dependencies = ["hid>=0.14"]
 
 [project.optional-dependencies]
+tray = ["pystray>=0.19", "Pillow>=10"]
 dev = ["pytest>=7"]
 
 [project.scripts]

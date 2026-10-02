@@ -83,18 +83,55 @@ rapoo-tray 的做法是：写命令 → `Sleep(20)` → `HidD_GetFeature`。本�
 
 | 地址 | 名称 | 长度 | 语义 | 状态 |
 | --- | --- | --- | --- | --- |
+| `0x88` | `dpi_table_x` | 变长 | X 轴各档 DPI，u16le × 档位数 | 已实现 |
+| `0xC8` | `dpi_table_y` | 变长 | Y 轴各档 DPI | 已实现 |
+| `0x96` | `dpi_slot_count` | 1 | 档位数，存的是 `档位数 − 1` | 已实现 |
+| `0x98` | `dpi_active_index` | 1 | 当前档位索引，0 起 | 已实现 |
 | `0x80` | `polling_hz` | 1 | 回报率码（见下表） | 已实现 |
 | `0x81` | `key_scan_rate` | 1 | 按键扫描率 | 地址已知，语义未验证 |
 | `0x84` | `lod` | 1 | 抬升高度档位 | 已实现 |
 | `0x85` | `motion_sync` | 1 | 移动同步 0/1 | 已实现 |
-| `0xC2` | `sleep_minutes` | 1 | 休眠 2..120 分钟 | 地址已知，范围来自 SDK 说明 |
-| `0xC3` | `linear_ripple` | 1 | 直线修正 / 波纹控制标志 | 已实现 |
+| `0xC0` | `debounce_ms` | 1 | 按键消抖时间 | 地址已知，语义未验证 |
+| `0xC1` | `lift_delay_ms` | 1 | 抬起延迟 | 地址已知，语义未验证 |
+| `0xC2` | `sleep_minutes` | 1 | 休眠 2..120 分钟 | 地址已知，范围来自说明 |
+| `0xC3` | `linear_ripple` | 1 | bit0 直线修正、bit1 波纹（0 = 开启） | 已实现 |
 | `0xC4` | `sensor_angle` | 1 | 传感器角度，有符号 | 已实现 |
 | `0xC5` | `glass_mode` | 1 | 玻璃模式 0/1 | 已实现 |
 
-**未验证**：DPI 相关寄存器（档位数、各档 DPI 值、当前档位）的具体地址。ClickSync 的
-rapoo 协议里出现过 `currentSlotCount: 0x96` 等常量，但未在本项目中确认，故未纳入
-快照范围——需要的话请用 `probe` 自行探索后扩展 `protocol.SYSTEM_REGISTERS`。
+**未纳入快照**（写入可能影响通信，需自行用 `probe` 探索后再扩展）：
+`0x60`（bank `0x00`，通信协议）、`0xD8`（无线策略 / LED 低电提示）、
+`0xDC..0xE2`（按回报率动态选择的性能模式寄存器）。
+
+### DPI 的下发顺序与变长表（重要）
+
+DPI 不是一个寄存器，而是一组有依赖关系的寄存器，协议对写入**顺序**和**长度**都有要求：
+
+1. 先写表 X（`0x88`）与表 Y（`0xC8`）；
+2. 再写档位数（`0x96`）；
+3. 最后写当前档位（`0x98`）。
+
+表的数据长度必须是 `档位数 × 2` 字节，而不是固定的 12 字节——档位数为 3 时只写 6 字节。
+顺序错了或长度不对，设备会按旧的档位数去解释表内容，表现为"DPI 设置不生效"。
+
+本项目用 `Register.order` 表达这个依赖（表 10/11 → 档位数 20 → 当前档位 21），并在下发
+DPI 表时按快照里的档位数裁剪长度；`tests/test_profiles.py` 中有对应测试锁住这两个约束。
+
+*来源：ClickSync `ADDR.dpiTableA/dpiTableB/currentSlotCount/currentDpiIndex`、
+`slotCountCode`、`dpiIndexU8` 与 `SPEC.dpiProfile.plan()` 的写入序列。*
+
+### 其它已知地址（来自 ClickSync，未纳入快照）
+
+| 地址 | 名称 | 说明 |
+| --- | --- | --- |
+| `0xC0` | `debounceMs` | 按键消抖 |
+| `0xC1` | `liftDelayMs` | 抬起延迟 |
+| `0xD8` | 无线策略 / LED 低电提示 | 一个地址两种用途，写入有风险 |
+| `0xDC`..`0xE2` | 性能模式 | 按回报率动态选择地址 |
+| `0x60`（bank `0x00`） | `commProtocol` | 通信协议类型 |
+| bank `0x06` | 按键映射 | `BUTTON_ADDR`，键值编码为 4 字节 [{funckey, keycode}] |
+
+按键映射（bank `0x06`）尚未纳入本项目，因为键值编码仍有一层未验证的细节；需要时可按
+rapoo-tray / ClickSync 的 `BUTTON_ADDR` 与 `keymapAction` 继续探索。
 
 ### 回报率码表（`0x80`）
 
@@ -151,9 +188,11 @@ rapoo 协议里出现过 `currentSlotCount: 0x96` 等常量，但未在本项目
 4. `rapoo-autoswitch snapshot 出厂备份` —— 先留一份可回滚的原始快照；
 5. 用 `get` / `set` 逐个验证 `0x80 / 0x84 / 0x85 / 0xC2 / 0xC3 / 0xC4 / 0xC5` 的
    语义，与官方软件界面比对；
-6. 用 `probe` 扫描 `0x08` 银行 `0x90..0xA0`、`0xC0..0xD0` 区间，定位 DPI 档位与
-   按键映射寄存器；
-7. 确认写入后**断开重连**配置是否保持（判断写的是 RAM 还是板载 Flash）。
+6. 用 `rapoo-autoswitch dpi` 核对各档 DPI 与当前档位是否与官方软件一致，并验证
+   "改档位数后 DPI 是否真的生效"（顺序/长度写错时的典型症状就是这里不生效）；
+7. 用 `probe` 扫描 `0x08` 银行 `0x90..0xA0`、`0xC0..0xD0`、`0xD8..0xE2` 区间，
+   补齐按键映射（bank `0x06`）与性能模式寄存器；
+8. 确认写入后**断开重连**配置是否保持（判断写的是 RAM 还是板载 Flash）。
 
 ## 10. 参考项目与许可
 
@@ -161,8 +200,11 @@ rapoo 协议里出现过 `currentSlotCount: 0x96` 等常量，但未在本项目
 | --- | --- | --- |
 | [Iris-0109/rapoo-tray](https://github.com/Iris-0109/rapoo-tray) | MIT | 移植三接口模型、状态报文布局、寄存器地址、机型表 |
 | [D3m0nZOnFire/mousectl](https://github.com/D3m0nZOnFire/mousectl) | MIT | 移植银行/寄存器读写与写后回读校验策略 |
-| [Nuitfanee/ClickSync](https://github.com/Nuitfanee/ClickSync) | GPL-2.0 | **仅作交叉验证，未复制任何代码** |
+| [Nuitfanee/ClickSync](https://github.com/Nuitfanee/ClickSync) | GPL-2.0 | **仅提取协议事实**：DPI 表地址、档位数/档位索引编码、写入序列。未复制任何代码 |
 
 [MIT 许可](https://opensource.org/license/mit)允许在保留版权声明的前提下使用与再分发，
-本项目因此在 `LICENSE` 中保留自有版权声明，并在上表与 README 中明确致谢。GPL-2.0 属
-传染性许可，为避免许可冲突，本项目未使用其任何代码。
+本项目因此在 `LICENSE` 中保留自有版权声明，并在上表与 README 中明确致谢。
+
+GPL-2.0 的 ClickSync 与 MIT 许可不兼容，因此本项目**没有**引入它的任何代码、注释或命名，
+只从中读取了互操作性所必需的**功能性事实**（寄存器地址、编码规则、写入顺序）。这也是
+各品牌第三方驱动（如 mousectl 对 Rapoo、Solaar 对 Logitech）普遍采用的做法。

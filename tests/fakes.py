@@ -38,7 +38,9 @@ class FakeTransport:
         length, addr, bank = frame[3], frame[4], frame[5]
         key = (bank, addr)
         if command == p.CMD_READ:
-            data = bytes(self.registers.get(key, bytearray(length)))
+            # 真实设备总是按请求长度应答，短的内容补零
+            stored = bytes(self.registers.get(key, b""))
+            data = stored.ljust(length, b"\x00")[:length]
             self._last_feature = self._feature(data)
         elif command == p.CMD_WRITE:
             data = frame[8:8 + length]

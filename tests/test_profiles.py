@@ -13,7 +13,11 @@ def make_session(registers=None, status_frames=None) -> Session:
 
 
 def full_registers(value=0x11):
-    return {(p.BANK_SYSTEM, reg.addr): bytes([value]) for reg in p.SYSTEM_REGISTERS}
+    """每个寄存器都按它自己的长度造数据（DPI 表是 12 字节）。"""
+    return {
+        (p.BANK_SYSTEM, reg.addr): bytes([value]) * reg.length
+        for reg in p.SYSTEM_REGISTERS
+    }
 
 
 def test_capture_save_load_roundtrip():
@@ -96,3 +100,69 @@ def test_session_reads_status_and_caches_battery():
 def test_missing_snapshot_raises():
     with pytest.raises(FileNotFoundError):
         profiles.load("不存在")
+
+
+# --- DPI：顺序与变长表 ---------------------------------------------------
+def test_apply_writes_dpi_in_protocol_order():
+    """协议要求：表 X → 表 Y → 档位数 → 当前档位。"""
+    session = make_session({})
+    snapshot = profiles.Snapshot(
+        name="办公",
+        product_id=0x1411,
+        registers={
+            "08:98": "00",  # 当前第 1 档
+            "08:96": "02",  # 共 3 档
+            "08:88": "20034006800c",  # 800 / 1600 / 3200
+            "08:c8": "20034006800c",
+        },
+    )
+    profiles.apply(session, snapshot)
+
+    written = [
+        (frame[5], frame[4])
+        for frame in session.transport.control_frames
+        if frame[2] == p.CMD_WRITE
+    ]
+    assert written == [(0x08, 0x88), (0x08, 0xC8), (0x08, 0x96), (0x08, 0x98)]
+
+
+def test_apply_trims_dpi_table_to_slot_count():
+    """表长必须是 `档位数 × 2`，多出来的槽位不能写下去。"""
+    session = make_session({})
+    snapshot = profiles.Snapshot(
+        name="x",
+        product_id=1,
+        registers={"08:88": "20034006800c000000000000", "08:96": "02"},
+    )
+    profiles.apply(session, snapshot)
+    assert session.transport.writes_to(p.BANK_SYSTEM, p.ADDR_DPI_TABLE_X) == [
+        bytes.fromhex("20034006800c")
+    ]
+
+
+def test_apply_keeps_full_table_without_slot_count():
+    session = make_session({})
+    snapshot = profiles.Snapshot(
+        name="x", product_id=1, registers={"08:88": "20034006800c000000000000"}
+    )
+    profiles.apply(session, snapshot)
+    assert len(session.transport.writes_to(p.BANK_SYSTEM, p.ADDR_DPI_TABLE_X)[0]) == 12
+
+
+def test_dpi_roundtrip_through_capture_and_apply():
+    registers = {
+        (p.BANK_SYSTEM, p.ADDR_DPI_TABLE_X): bytes.fromhex("20034006800c"),
+        (p.BANK_SYSTEM, p.ADDR_DPI_TABLE_Y): bytes.fromhex("20034006800c"),
+        (p.BANK_SYSTEM, p.ADDR_DPI_SLOT_COUNT): b"\x02",
+        (p.BANK_SYSTEM, p.ADDR_DPI_ACTIVE_INDEX): b"\x01",
+    }
+    source = make_session(registers)
+    snapshot = profiles.capture(source, "游戏", 0x1411)
+
+    target = make_session({})
+    profiles.apply(target, snapshot)
+    assert target.transport.registers[(p.BANK_SYSTEM, p.ADDR_DPI_TABLE_X)] == bytes.fromhex(
+        "20034006800c"
+    )
+    assert target.transport.registers[(p.BANK_SYSTEM, p.ADDR_DPI_SLOT_COUNT)] == b"\x02"
+    assert target.transport.registers[(p.BANK_SYSTEM, p.ADDR_DPI_ACTIVE_INDEX)] == b"\x01"

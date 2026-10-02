@@ -107,19 +107,47 @@ def delete(name: str) -> None:
     path.unlink()
 
 
+def _slot_count(snapshot: Snapshot) -> Optional[int]:
+    """从快照里取 DPI 档位数；缺这项时返回 None。
+
+    档位数决定 DPI 表的实际字节数，协议要求写入长度等于 ``档位数 × 2``。
+    """
+    raw = snapshot.registers.get(p.DPI_SLOT_COUNT_KEY)
+    if not raw:
+        return None
+    try:
+        return min(int(raw, 16) + 1, p.DPI_MAX_SLOTS)
+    except ValueError:
+        return None
+
+
 def apply(
     session: Session,
     snapshot: Snapshot,
     only: Optional[Iterable[str]] = None,
 ) -> List[str]:
-    """把快照里的寄存器逐个写入鼠标，返回实际写成功的键列表。"""
+    """把快照里的寄存器写入鼠标，返回实际写成功的键列表。
+
+    按 ``Register.order`` 排序下发——DPI 表必须早于档位数和当前档位，否则设备会
+    按旧档位数解释表内容。未知寄存器排到最后，保证已知的依赖关系不被破坏。
+    """
     wanted = set(only) if only is not None else None
-    written: List[str] = []
+    slots = _slot_count(snapshot)
+
+    plan = []
     for key, hex_value in snapshot.registers.items():
         if wanted is not None and key not in wanted:
             continue
+        reg = p.REGISTRY_BY_KEY.get(key)
+        plan.append((reg.order if reg else 1000, key, bytes.fromhex(hex_value), reg))
+    plan.sort(key=lambda item: item[0])
+
+    written: List[str] = []
+    for _, key, data, reg in plan:
+        if reg is not None and reg.kind == "dpi_table" and slots:
+            data = data[: slots * 2]
         bank, addr = _split(key)
-        session.write_raw(bank, addr, bytes.fromhex(hex_value))
+        session.write_raw(bank, addr, data)
         written.append(key)
     return written
 

@@ -62,6 +62,14 @@ def test_cli_parser_accepts_core_commands():
     assert parser.parse_args(["daemon", "--once"]).once is True
 
 
+def test_cli_parser_accepts_dpi_command():
+    parser = cli.build_parser()
+    args = parser.parse_args(["dpi", "800,1600,3200", "--index", "2"])
+    assert args.stages == "800,1600,3200"
+    assert args.index == 2
+    assert parser.parse_args(["dpi"]).stages is None
+
+
 def test_cli_set_encodes_values():
     from rapoo_autoswitch import protocol as p
 

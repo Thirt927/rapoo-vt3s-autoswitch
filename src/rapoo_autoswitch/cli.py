@@ -36,6 +36,12 @@ def _open_session(vendor_id: int):
 
 
 def _decode(reg: p.Register, raw: bytes) -> str:
+    if reg.kind == "dpi_table":
+        values = reg.decode(raw)
+        return " / ".join(str(v) for v in values) if values else "（空）"
+    if reg.name == "linear_ripple":
+        byte = raw[0]
+        return f"直线修正{'关' if byte & 0x01 else '开'}，波纹{'关' if byte & 0x02 else '开'}"
     value = reg.decode(raw)
     if reg.kind == "polling":
         return f"{value} Hz"
@@ -48,6 +54,8 @@ def _decode(reg: p.Register, raw: bytes) -> str:
 
 def _parse_value(reg: p.Register, text: str):
     lowered = text.strip().lower()
+    if reg.kind == "dpi_table":
+        return text  # encode() 会解析 "800,1600" 这种写法
     if reg.kind == "bool":
         return lowered in ("1", "on", "true", "yes", "开", "true")
     return int(text, 0)
@@ -134,6 +142,54 @@ def cmd_set(args) -> int:
     return 0
 
 
+def cmd_dpi(args) -> int:
+    """查看 / 设置 DPI 档位。
+
+    设置时严格按协议顺序下发：表 X → 表 Y → 档位数 → 当前档位，并把当前档位
+    夹到新档位数范围内，避免设备引用了不存在的档位。
+    """
+    _, session = _open_session(args.vendor_id)
+    with session:
+        if args.stages:
+            values = [int(v) for v in args.stages.replace(",", " ").split()]
+            count = len(values)
+            if not 1 <= count <= p.DPI_MAX_SLOTS:
+                raise SystemExit(f"档位数需在 1..{p.DPI_MAX_SLOTS} 之间，收到 {count}")
+            table = b"".join(v.to_bytes(2, "little") for v in values)
+            session.write_raw(p.BANK_SYSTEM, p.ADDR_DPI_TABLE_X, table)
+            session.write_raw(p.BANK_SYSTEM, p.ADDR_DPI_TABLE_Y, table)
+            session.write_raw(p.BANK_SYSTEM, p.ADDR_DPI_SLOT_COUNT, bytes([count - 1]))
+            index = min(max(args.index or 1, 1), count)
+            session.write_raw(p.BANK_SYSTEM, p.ADDR_DPI_ACTIVE_INDEX, bytes([index - 1]))
+            print(f"已写入 {count} 档 DPI：{' / '.join(str(v) for v in values)}，当前第 {index} 档")
+            return 0
+
+        if args.index:
+            count = session.read_register(p.REGISTRY["dpi_slot_count"])[0] + 1
+            index = min(max(args.index, 1), count)
+            session.write_raw(p.BANK_SYSTEM, p.ADDR_DPI_ACTIVE_INDEX, bytes([index - 1]))
+            print(f"当前档位已切到第 {index} 档（共 {count} 档）")
+            return 0
+
+        count = session.read_register(p.REGISTRY["dpi_slot_count"])[0] + 1
+        index = session.read_register(p.REGISTRY["dpi_active_index"])[0] + 1
+        axis_x = p.REGISTRY["dpi_table_x"].decode(
+            session.read_register(p.REGISTRY["dpi_table_x"])
+        )
+        axis_y = p.REGISTRY["dpi_table_y"].decode(
+            session.read_register(p.REGISTRY["dpi_table_y"])
+        )
+
+    print(f"档位数 {count}，当前第 {index} 档")
+    for slot in range(min(count, len(axis_x))):
+        x = axis_x[slot]
+        y = axis_y[slot] if slot < len(axis_y) else x
+        suffix = f"（Y 轴 {y}）" if y != x else ""
+        mark = "  <- 当前" if slot + 1 == index else ""
+        print(f"  {slot + 1}. {x} DPI{suffix}{mark}")
+    return 0
+
+
 def cmd_probe(args) -> int:
     """原始读取，用于逆向新机型/新寄存器。"""
     _, session = _open_session(args.vendor_id)
@@ -213,6 +269,15 @@ def cmd_current(args) -> int:
     return 0
 
 
+def cmd_tray(args) -> int:
+    from .tray import POLL_S, TrayApp
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    app = TrayApp(preset=args.preset, interval=args.interval or POLL_S)
+    app.run()
+    return 0
+
+
 def cmd_daemon(args) -> int:
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
@@ -284,6 +349,11 @@ def build_parser() -> argparse.ArgumentParser:
     set_.add_argument("assignments", nargs="+")
     set_.set_defaults(func=cmd_set)
 
+    dpi = sub.add_parser("dpi", help="查看或设置 DPI 档位")
+    dpi.add_argument("stages", nargs="?", help="各档 DPI，如 800,1600,3200")
+    dpi.add_argument("--index", type=int, help="切换当前档位（1 起）")
+    dpi.set_defaults(func=cmd_dpi)
+
     probe = sub.add_parser("probe", help="原始读取，用于逆向新机型")
     probe.add_argument("bank", type=lambda v: int(v, 0))
     probe.add_argument("addr", type=lambda v: int(v, 0))
@@ -312,6 +382,11 @@ def build_parser() -> argparse.ArgumentParser:
     daemon_parser.add_argument("--interval", type=float, help="探测间隔（秒）")
     daemon_parser.add_argument("--once", action="store_true", help="只跑一轮，便于调试")
     daemon_parser.set_defaults(func=cmd_daemon)
+
+    tray_parser = sub.add_parser("tray", help="托盘常驻版：显示电量、切换配置")
+    tray_parser.add_argument("--preset", help="启动时使用的快照，覆盖本机预设")
+    tray_parser.add_argument("--interval", type=float, help="电量刷新间隔（秒）")
+    tray_parser.set_defaults(func=cmd_tray)
 
     startup = sub.add_parser("startup", help="开机自启（Windows）")
     startup.add_argument("action", choices=["install", "uninstall", "status"])
