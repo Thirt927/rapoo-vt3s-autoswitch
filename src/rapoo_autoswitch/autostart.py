@@ -22,13 +22,16 @@ def command(mode: str = "daemon") -> str:
     if mode not in MODES:
         raise ValueError(f"不支持的自启方式：{mode}（可选 {'、'.join(MODES)}）")
     if getattr(sys, "frozen", False):
-        # 免安装 exe：它自己就是可执行文件，不能再拼 `-m rapoo_autoswitch`；
-        # 用 --hidden 让常驻进程把自己那个控制台窗口藏起来。
+        # 免安装 exe：主 exe 是 console=False（不分配控制台，开机自启零黑框）。
+        # 直接传 daemon/tray 子命令即可——主 exe 收到后会通过
+        # _maybe_reexec_daemon_or_tray 转发到控制台版 exe（rapoo_autoswitch_console.exe）
+        # 去跑实际业务，自身立即退出。交互命令（list/config/apply 等）仍走
+        # 控制台版 exe，不受影响。
         return f'"{sys.executable}" {mode} --hidden'
     executable = Path(sys.executable)
     quiet = executable.with_name("pythonw.exe")
     launcher = quiet if quiet.exists() else executable
-    return f'"{launcher}" -m rapoo_autoswitch {mode}'
+    return f'"{launcher}" -m rapoo_autoswitch {mode} --hidden'
 
 
 def install(mode: str = "daemon") -> str:

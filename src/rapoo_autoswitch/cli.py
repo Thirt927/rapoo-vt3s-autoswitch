@@ -17,6 +17,7 @@ import os
 import subprocess
 import sys
 import time
+from pathlib import Path
 from typing import IO, List, Optional
 
 from . import __version__, autostart, daemon, doctor
@@ -49,38 +50,21 @@ def _log_stream() -> Optional[IO[str]]:
             return None
 
 
-def _detach_console() -> None:
-    """从当前控制台脱离，并把输出改写到日志文件。
-
-    托盘是常驻后台程序。若从终端启动，它挂在那个控制台上，**终端一关就被一起
-    杀掉**（用户实际遇到的坑）。调用 ``FreeConsole`` 脱离之后，终端关闭不再
-    影响它；双击启动时那个黑框也会因为"没有进程附着"而自动消失。
-
-    脱离后原来的 stdout/stderr 句柄已失效，再写会报错，所以顺手改成日志文件——
-    后台跑的东西出了问题总得有个地方可查。
-    """
-    if sys.platform != "win32":
-        return
-    try:
-        import ctypes
-
-        ctypes.windll.kernel32.FreeConsole()
-    except Exception:  # noqa: BLE001 - 脱不了就照常跑
-        return
-    stream = _log_stream()
-    if stream is not None:
-        sys.stdout = stream
-        sys.stderr = stream
-
-
 def _spawn_detached(argv: List[str]) -> None:
     """把常驻程序拉成独立进程，和当前控制台彻底断开。
 
     菜单里选「托盘常驻」时用：当前进程还要继续显示菜单，不能自己也脱掉控制台，
     所以另起一个进程去跑 tray。这样关掉菜单窗口也不会带走托盘。
+
+    主 exe（console=False）没有自己的控制台，tray 需要持续跑后台循环——
+    拉控制台版 exe（``rapoo_autoswitch_console.exe``）去跑，``CREATE_NO_WINDOW``
+    保证子进程不弹新窗口；控制台版 exe 的 ``FreeConsole`` 让它彻底独立。
     """
-    if getattr(sys, "frozen", False):
-        cmd = [sys.executable, *argv]
+    frozen = getattr(sys, "frozen", False)
+    if frozen:
+        console_exe = Path(sys.executable).with_name("rapoo_autoswitch_console.exe")
+        # 控制台版 exe 和主 exe 并排放在 dist/ 里；找不到就退回主 exe 自身
+        cmd = ([str(console_exe)] if console_exe.exists() else [sys.executable]) + argv
     else:
         cmd = [sys.executable, "-m", "rapoo_autoswitch", *argv]
     # DETACHED_PROCESS | CREATE_NO_WINDOW：不附控制台，也不弹黑框
@@ -89,6 +73,58 @@ def _spawn_detached(argv: List[str]) -> None:
         subprocess.Popen(cmd, creationflags=flags, close_fds=True)
     except OSError as exc:
         print(f"  启动失败：{exc}")
+
+
+def _find_console_exe() -> Optional[Path]:
+    """找同目录下的控制台版 exe；找不到返回 None。
+
+    主 exe（``rapoo-autoswitch.exe``）找到的控制台版是另一个文件；
+    控制台版 exe 自己找不到自己（名字不一致），返回 None。
+    """
+    if not getattr(sys, "frozen", False):
+        return None
+    exe_name = Path(sys.executable).name.lower()
+    # 控制台版 exe 自己：不转发（直接跑）
+    if "console" in exe_name:
+        return None
+    candidate = Path(sys.executable).with_name("rapoo_autoswitch_console.exe")
+    return candidate if candidate.exists() else None
+
+
+def _maybe_reexec_daemon_or_tray(args) -> int:
+    """主 exe（console=False）转发 daemon/tray 到控制台版 exe。
+
+    主 exe 不分配控制台窗口（开机自启零黑框），但 daemon/tray 是常驻后台
+    循环，需要一个有控制台句柄的进程去跑（日志、信号处理）。转发时主 exe
+    自身立即退出，控制台版子进程用 ``FreeConsole`` 彻底独立。
+
+    如果没找到控制台版 exe（比如用户只拷了主 exe），退回主 exe 自身跑——
+    此时 ``_detach_console`` 会 ``FreeConsole``，功能不变。
+
+    ``None`` 表示不转发（正常跑）；整数表示转发成功（主 exe 应以此码退出）。
+    """
+    # 用 args.func 判断子命令：cmd_tray / cmd_daemon 才转发
+    if args.func not in (cmd_tray, cmd_daemon):
+        return None
+    if not getattr(sys, "frozen", False):
+        return None  # 源码模式：pythonw/python 自带控制台，无需转发
+    console_exe = _find_console_exe()
+    if console_exe is None:
+        return None  # 没控制台版 exe，主 exe 自己跑（FreeConsole 兜底）
+    action = "tray" if args.func is cmd_tray else "daemon"
+    cmd = [str(console_exe), action]
+    if getattr(args, "hidden", False):
+        cmd.append("--hidden")
+    if getattr(args, "once", False):
+        cmd.append("--once")
+    if getattr(args, "preset", None):
+        cmd.extend(["--preset", args.preset])
+    if getattr(args, "interval", None):
+        cmd.extend(["--interval", str(args.interval)])
+    # CREATE_NO_WINDOW：主 exe 没有控制台，子进程也不弹新窗口
+    flags = 0x08000000 if sys.platform == "win32" else 0
+    subprocess.Popen(cmd, creationflags=flags, close_fds=True)
+    return 0  # 主 exe 立即退出，控制台版子进程独立运行
 
 
 def _acquire_singleton() -> bool:
@@ -110,20 +146,95 @@ def _acquire_singleton() -> bool:
         return True
 
 
-def _hide_console() -> None:
-    """把自己的控制台窗口藏起来。
+# --------------------------------------------------------------------------
+# Windows 控制台辅助（开机自启 / 后台运行）
+# --------------------------------------------------------------------------
+_WS_EX_TOOLWINDOW = 0x00000080  # 任务栏不显示按钮
+_GWL_EXSTYLE = -20
+_SW_HIDE = 0
+_DETACH_RETRIES = 5
+_DETACH_INTERVAL_S = 0.2
 
-    给开机自启的 ``--hidden`` 用：那时用户不想看见黑框。托盘另有
-    ``_detach_console`` 直接脱控制台，连窗口都不需要藏。
+
+def _win_ctypes():
+    """一次加载 user32 + kernel32 的 ctypes 句柄（仅 Windows 有效）。
+
+    设好 argtypes / restype，避免 64 位下 HWND 被截断或签名推断错误。
+    """
+    import ctypes
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetConsoleWindow.restype = ctypes.c_void_p
+    user32.ShowWindow.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    user32.ShowWindow.restype = ctypes.c_bool
+    user32.SetWindowLongPtrW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
+    user32.SetWindowLongPtrW.restype = ctypes.c_void_p
+    user32.GetWindowLongPtrW.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    user32.GetWindowLongPtrW.restype = ctypes.c_void_p
+    return user32, kernel32
+
+
+def _hide_console() -> None:
+    """把控制台窗口彻底藏掉：隐藏 + 任务栏移除按钮。
+
+    仅 ``ShowWindow(SW_HIDE)`` 不够——黑框消失了但任务栏仍留一个按钮。
+    加 ``WS_EX_TOOLWINDOW`` 让系统把任务栏条目也摘掉，做到"后台挂起、
+    界面无痕"。重试几次：PyInstaller onefile 的子进程刚启动时控制台窗口
+    可能还没就绪，首次 ``GetConsoleWindow`` 可能拿 0。
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        user32, kernel32 = _win_ctypes()
+        for _ in range(_DETACH_RETRIES):
+            hwnd = kernel32.GetConsoleWindow()
+            if not hwnd:
+                time.sleep(_DETACH_INTERVAL_S)
+                continue
+            # 1) 任务栏移除按钮
+            ex = user32.GetWindowLongPtrW(hwnd, _GWL_EXSTYLE)
+            if ex is not None and not (ex & _WS_EX_TOOLWINDOW):
+                user32.SetWindowLongPtrW(hwnd, _GWL_EXSTYLE, ex | _WS_EX_TOOLWINDOW)
+            # 2) 隐藏窗口
+            user32.ShowWindow(hwnd, _SW_HIDE)
+            break
+    except Exception:  # noqa: BLE001 - 拿不到窗口 / 改不了样式就不影响功能
+        pass
+
+
+def _detach_console() -> None:
+    """从当前控制台脱离，并把输出改写到日志文件。
+
+    托盘是常驻后台程序。若从终端启动，它挂在那个控制台上，**终端一关就被
+    一起杀掉**。``FreeConsole`` 脱离之后，终端关闭不再影响它。
+
+    脱离后原来的 stdout/stderr 句柄已失效，再写会报错，所以顺手改成日志
+    文件——后台跑的东西出了问题总得有个地方可查。
     """
     if sys.platform != "win32":
         return
     try:
         import ctypes
 
-        ctypes.windll.user32.ShowWindow(ctypes.windll.kernel32.GetConsoleWindow(), 0)
-    except Exception:  # noqa: BLE001 - 拿不到窗口就算了，不影响功能
-        pass
+        ctypes.windll.kernel32.FreeConsole()
+    except Exception:  # noqa: BLE001 - 脱不了就照常跑
+        return
+    stream = _log_stream()
+    if stream is not None:
+        sys.stdout = stream
+        sys.stderr = stream
+
+
+def _hide_and_detach_console() -> None:
+    """``--hidden`` 的统一处理：先藏窗口（视觉上立刻消失），再脱离控制台
+    （关掉窗口 / 注销用户后程序继续跑）。
+
+    顺序重要：先 ``_hide_console`` 再 ``FreeConsole``。``FreeConsole`` 之后
+    窗口可能短暂闪烁，所以先藏；藏了之后即便没真正脱掉，至少视觉上干净。
+    """
+    _hide_console()
+    _detach_console()
 
 
 def _decode(reg: p.Register, raw: bytes) -> str:
@@ -138,6 +249,9 @@ def _decode(reg: p.Register, raw: bytes) -> str:
     value = reg.decode(raw)
     if reg.kind == "polling":
         return f"{value} Hz"
+    if reg.kind == "keyscan":
+        name = p.keyscan_name(raw[0])
+        return f"{value} Hz ({name})" if name else f"{value}"
     if reg.kind == "bool":
         return "开" if value else "关"
     if reg.kind == "minutes":
@@ -479,9 +593,13 @@ def cmd_tray(args) -> int:
         print("托盘已经在运行了，看右下角托盘区的小图标。这个窗口可以关掉。")
         return 0
     if getattr(args, "hidden", False):
-        _hide_console()
-    # 托盘是长住后台的：先脱离控制台，这样从终端启动后关掉终端也不影响它
-    _detach_console()
+        # 开机自启场景：先藏窗口（黑框立刻消失），再脱控制台
+        # （关掉窗口 / 注销用户后进程继续跑）
+        _hide_and_detach_console()
+    else:
+        # 手动跑 tray：保留控制台用于交互，但同样要脱离控制台，
+        # 这样从终端启动后关掉终端也不会带走托盘
+        _detach_console()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     app = TrayApp(preset=args.preset, interval=args.interval or POLL_S)
     app.run()
@@ -490,7 +608,8 @@ def cmd_tray(args) -> int:
 
 def cmd_daemon(args) -> int:
     if getattr(args, "hidden", False):
-        _hide_console()
+        # 开机自启场景：藏窗口 + 脱控制台（关掉窗口/注销后继续跑）
+        _hide_and_detach_console()
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
     )
@@ -713,19 +832,49 @@ def _pause(prompt: str = "按回车继续…") -> None:
         pass
 
 
+def _tray_default_launch() -> int:
+    """双击主 exe（console=False，无参数）时的默认行为：后台启动托盘。
+
+    主 exe 没有控制台，stdin/stdout 都是 None。这里：
+    1. 检查单例（托盘已在跑就静默退出）
+    2. 转发到控制台版 exe 跑 tray（--hidden 隐藏窗口）
+    3. 控制台版自己 FreeConsole 后独立运行
+    4. 主 exe 立即退出
+    """
+    if not _acquire_singleton():
+        return 0
+    console_exe = _find_console_exe()
+    if console_exe is not None:
+        # 转发到控制台版 exe，--hidden 隐藏窗口
+        flags = 0x08000000 if sys.platform == "win32" else 0  # CREATE_NO_WINDOW
+        subprocess.Popen(
+            [str(console_exe), "tray", "--hidden"],
+            creationflags=flags,
+            close_fds=True,
+        )
+        return 0
+    # 没找到控制台版 exe：主 exe 自己跑 tray（FreeConsole 兜底）
+    from .tray import POLL_S, TrayApp
+    from .config import load_config
+    config = load_config()
+    preset = config.get("preset")
+    _hide_and_detach_console()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    app = TrayApp(preset=preset, interval=config.get("poll_interval_s", POLL_S))
+    app.run()
+    return 0
+
+
 def _no_args() -> int:
     """没带参数时（双击 exe 的典型情形）给一个菜单。
 
     双击的用户不会去敲参数，所以这里不能只丢一堆 usage 就退出。
     """
     if not (sys.stdin is not None and sys.stdin.isatty()):
-        # 非交互（管道 / 重定向）：只打印用法，别把调用方卡住
-        print("rapoo-autoswitch —— 按电脑自动切换雷柏二代鼠标配置")
-        print()
-        print("常用：rapoo-autoswitch  setup / doctor / status / tray / daemon")
-        print()
-        build_parser().print_help()
-        return 0
+        # 非交互（管道 / 重定向 / 双击 console=False exe）：
+        # 默认直接启动托盘（后台常驻），不卡调用方
+        print("未检测到交互终端，自动启动托盘版…")
+        return _tray_default_launch()
 
     while True:
         print()
@@ -763,12 +912,19 @@ def _no_args() -> int:
 
 
 def _make_stdout_safe() -> None:
-    """输出编码兜底。
+    """输出编码兜底 + None 流保护。
 
     中文 Windows 上，输出一旦被重定向（管道、写文件），Python 就用 GBK 编码，
     遇到不能编码的字符会直接抛 ``UnicodeEncodeError`` 把命令打断。这里降级成
     替换字符，保证命令不会因为一行输出而崩掉。
+
+    主 exe（console=False）没有控制台，sys.stdout / sys.stderr 可能是 None。
+    此时替换为 os.devnull 流，避免后续 print / print_help 崩溃。
     """
+    if sys.stdout is None:
+        sys.stdout = open(os.devnull, "w")
+    if sys.stderr is None:
+        sys.stderr = open(os.devnull, "w")
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.reconfigure(errors="replace")
@@ -784,6 +940,10 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     parser = build_parser()
     args = parser.parse_args(raw)
+    # 主 exe（console=False）把 daemon/tray 转发到控制台版 exe，自身立即退出
+    forwarded = _maybe_reexec_daemon_or_tray(args)
+    if forwarded is not None:
+        return forwarded
     try:
         return args.func(args)
     except (dev.DeviceError, FileNotFoundError, RuntimeError, ValueError) as exc:

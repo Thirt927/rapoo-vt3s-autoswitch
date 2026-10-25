@@ -39,6 +39,30 @@ FRAME_SIZE = 33
 MAX_PAYLOAD = 25
 """单帧可携带的最大数据长度：33 - 8 字节头部。"""
 
+# --- 回报率 / 按键扫描率协议码（bank 0x00 逻辑地址）----------------------
+# A-Hub DLL 中 0x80 是回报率、0x81 是按键扫描率；两者码值独立。
+POLLING_HZ_TO_CODE: Dict[int, int] = {
+    125: 0x08,
+    250: 0x04,
+    500: 0x02,
+    1000: 0x01,
+    2000: 0x84,
+    4000: 0x82,
+    8000: 0x81,
+}
+POLLING_CODE_TO_HZ: Dict[int, int] = {v: k for k, v in POLLING_HZ_TO_CODE.items()}
+
+# 按键扫描率协议码：A-Hub DLL 中 setKeyScanRate 对应 bank 0x00 / addr 0x81。
+# 实测样本有限，登记常见值；未知码值由调用方按原始字节展示。
+KEYSCAN_HZ_TO_CODE: Dict[int, int] = {
+    125: 0x08,
+    250: 0x04,
+    500: 0x02,
+    1000: 0x01,
+}
+KEYSCAN_CODE_TO_HZ: Dict[int, int] = {v: k for k, v in KEYSCAN_HZ_TO_CODE.items()}
+KEYSCAN_NAMES: Dict[int, str] = {code: f"{hz}Hz" for hz, code in KEYSCAN_HZ_TO_CODE.items()}
+
 # --- 存储银行 -------------------------------------------------------------
 BANK_COMM = 0x00
 BANK_BUTTON = 0x06
@@ -47,6 +71,19 @@ BANK_SYSTEM = 0x08
 
 注意：这里指的是**第 0 组**板载配置的系统银行。设备实际有多组配置，
 真正生效的是哪一组由 ``ADDR_ACTIVE_PROFILE`` 决定，见下。
+"""
+
+ADDR_WIRELESS_STRATEGY = 0xD8
+WIRELESS_STRATEGY_BYTES = 4
+"""无线策略块（``0xD8..0xDB``，4 字节）。
+
+A-Hub 官方驱动（RapooDevice.dll）里 0xD8 是引用密度最高的系统寄存器之一
+（1036 处 LE 引用），承载 2.4G 接收器的无线策略：8K 开关、RF 加强、
+低延迟模式等。本工具当前**只读不写**——写入需要 A-Hub 完整协议
+（``setWireless8KSwitch`` / ``setRFStrengthenSwitch`` / ``setDgChannel`` 等
+联动），且不同芯片平台（Nordic54 / Telink / WCH585 / Bolutek）字节
+语义不同，盲目写有概率让 2.4G 接收失败。纳入快照采集保证备份完整，
+但默认下发时跳过（见 ``Register.write_enabled``）。
 """
 
 # --- 板载配置分组 ---------------------------------------------------------
@@ -271,11 +308,17 @@ class Register:
     name: str
     length: int = 1
     kind: str = "byte"
-    """取值语义：``byte`` / ``polling`` / ``bool`` / ``minutes`` / ``angle`` /
-    ``dpi_table`` / ``slot_count`` / ``dpi_index``。"""
+    """取值语义：``byte`` / ``polling`` / ``keyscan`` / ``bool`` / ``minutes`` /
+    ``angle`` / ``dpi_table`` / ``slot_count`` / ``dpi_index``。"""
     help: str = ""
+    label: str = ""
+    """人类可读的中文短标签，用于托盘 / CLI 展示。例如「DPI 档位表」「回报率」。"""
     order: int = 100
     """下发顺序，小的先写。协议有依赖关系时必须显式指定。"""
+    write_enabled: bool = True
+    """是否参与 ``apply`` 下发。采集（``capture``）始终包含；下发时跳过
+    ``write_enabled=False`` 的寄存器。用于"只备份不写"的复杂块（如
+    无线策略 0xD8）。"""
 
     @property
     def key(self) -> str:
@@ -293,6 +336,9 @@ class Register:
         value = raw[0] if self.length == 1 else raw
         if self.kind == "polling":
             return POLLING_CODE_TO_HZ.get(value, value)
+        if self.kind == "keyscan":
+            # 按键扫描率档位码值；查不到映射时返回原始码（调用方再决定怎么展示）
+            return KEYSCAN_CODE_TO_HZ.get(value, value)
         if self.kind == "bool":
             return bool(value)
         if self.kind == "angle":
@@ -321,6 +367,15 @@ class Register:
             if hz not in POLLING_HZ_TO_CODE:
                 raise ValueError(f"不支持的回报率 {hz} Hz")
             value = POLLING_HZ_TO_CODE[hz]
+        elif self.kind == "keyscan":
+            # 接受 Hz（int）或原始码（int）；Hz 走映射，未知 Hz 抛错
+            hz = int(value)
+            if hz in KEYSCAN_HZ_TO_CODE:
+                value = KEYSCAN_HZ_TO_CODE[hz]
+            elif hz in KEYSCAN_CODE_TO_HZ:
+                value = hz  # 已经是码值，原样落盘
+            else:
+                raise ValueError(f"不支持的按键扫描率 {hz} Hz")
         elif self.kind == "bool":
             value = 1 if value else 0
         elif self.kind in ("slot_count", "dpi_index"):
@@ -331,53 +386,78 @@ class Register:
         return int(value).to_bytes(self.length, "little", signed=self.kind == "angle")
 
 
-POLLING_HZ_TO_CODE: Dict[int, int] = {
-    125: 0x08,
-    250: 0x04,
-    500: 0x02,
-    1000: 0x01,
-    2000: 0x84,
-    4000: 0x82,
-    8000: 0x81,
-}
-POLLING_CODE_TO_HZ: Dict[int, int] = {v: k for k, v in POLLING_HZ_TO_CODE.items()}
+def keyscan_name(code: int) -> Optional[str]:
+    """按键扫描率码值 → 档位名；未登记返回 ``None``。"""
+    return KEYSCAN_NAMES.get(code)
 
 
 SYSTEM_REGISTERS: List[Register] = [
     # --- DPI：协议要求先写两张表，再写档位数，最后写当前档位 ---
     Register(
         BANK_SYSTEM, ADDR_DPI_TABLE_X, "dpi_table_x", length=DPI_TABLE_BYTES,
-        kind="dpi_table", order=10, help="X 轴各档 DPI（u16le × 档位数）",
+        kind="dpi_table", order=10,
+        help="X 轴各档 DPI（u16le × 档位数）",
+        label="DPI X 轴档位表",
     ),
     Register(
         BANK_SYSTEM, ADDR_DPI_TABLE_Y, "dpi_table_y", length=DPI_TABLE_BYTES,
-        kind="dpi_table", order=11, help="Y 轴各档 DPI（u16le × 档位数）",
+        kind="dpi_table", order=11,
+        help="Y 轴各档 DPI（u16le × 档位数）",
+        label="DPI Y 轴档位表",
     ),
     Register(
         BANK_SYSTEM, ADDR_DPI_SLOT_COUNT, "dpi_slot_count", kind="slot_count",
         order=20, help="启用的 DPI 档位数（1..6）",
+        label="DPI 档位数",
     ),
     Register(
         BANK_SYSTEM, ADDR_DPI_ACTIVE_INDEX, "dpi_active_index", kind="dpi_index",
         order=21, help="当前生效的档位（1..档位数）",
+        label="当前 DPI 档位",
     ),
     # --- 性能与时间 ---
-    Register(BANK_SYSTEM, 0x80, "polling_hz", kind="polling", order=40, help="回报率"),
-    Register(BANK_SYSTEM, 0x81, "key_scan_rate", order=41, help="按键扫描率"),
-    Register(BANK_SYSTEM, 0x84, "lod", order=42, help="抬升高度（LOD）档位"),
-    Register(BANK_SYSTEM, 0x85, "motion_sync", kind="bool", order=43, help="移动同步"),
-    Register(BANK_SYSTEM, 0xC0, "debounce_ms", order=44, help="按键消抖时间"),
-    Register(BANK_SYSTEM, 0xC1, "lift_delay_ms", order=45, help="抬起延迟"),
+    Register(
+        BANK_SYSTEM, 0x80, "polling_hz", kind="polling", order=40,
+        help="回报率", label="回报率（轮询率）",
+    ),
+    Register(
+        BANK_SYSTEM, 0x81, "key_scan_rate", kind="keyscan", order=41,
+        help="按键扫描率档位（A-Hub setKeyScanRate，与回报率独立）",
+        label="按键扫描率",
+    ),
+    Register(
+        BANK_SYSTEM, 0x84, "lod", order=42,
+        help="抬升高度（LOD）档位", label="抬升高度（LOD）",
+    ),
+    Register(
+        BANK_SYSTEM, 0x85, "motion_sync", kind="bool", order=43,
+        help="移动同步", label="移动同步（Y-Snap）",
+    ),
+    Register(
+        BANK_SYSTEM, 0xC0, "debounce_ms", order=44,
+        help="按键消抖时间", label="按键消抖",
+    ),
+    Register(
+        BANK_SYSTEM, 0xC1, "lift_delay_ms", order=45,
+        help="抬起延迟", label="抬起延迟",
+    ),
     Register(
         BANK_SYSTEM, 0xC2, "sleep_minutes", kind="minutes", order=46,
-        help="休眠时间（2..120 分钟）",
+        help="休眠时间（2..120 分钟）", label="休眠时间",
     ),
     Register(
         BANK_SYSTEM, 0xC3, "linear_ripple", order=47,
         help="bit0 直线修正、bit1 波纹控制（0=开启）",
+        label="直线修正 / 波纹抑制",
     ),
-    Register(BANK_SYSTEM, 0xC4, "sensor_angle", kind="angle", order=48, help="传感器角度"),
-    Register(BANK_SYSTEM, 0xC5, "glass_mode", kind="bool", order=49, help="玻璃模式"),
+    Register(
+        BANK_SYSTEM, 0xC4, "sensor_angle", kind="angle", order=48,
+        help="传感器角度", label="传感器角度",
+    ),
+    Register(
+        BANK_SYSTEM, 0xC5, "glass_mode", kind="bool", order=49,
+        help="玻璃模式", label="玻璃表面模式",
+    ),
     # --- 性能模式（A-Hub 里的"扫描率"档位）---
     # 必须排在回报率（0x80，order=40）之后：固件会按回报率重排这一块，
     # 先写回报率再写它，才不会互相覆盖。
@@ -385,6 +465,16 @@ SYSTEM_REGISTERS: List[Register] = [
         BANK_SYSTEM, ADDR_PERFORMANCE, "performance_mode", length=PERFORMANCE_BYTES,
         kind="blob", order=50,
         help="性能模式块 0xDC..0xE2（随回报率联动，按原始字节存取）",
+        label="性能模式（8K/RF）",
+    ),
+    # --- 无线策略（A-Hub 8K 开关 / RF 加强 / 低延迟模式）---
+    # 只备份不写：不同芯片平台字节语义不同，写入需 A-Hub 完整协议。
+    Register(
+        BANK_SYSTEM, ADDR_WIRELESS_STRATEGY, "wireless_strategy",
+        length=WIRELESS_STRATEGY_BYTES, kind="blob", order=60,
+        write_enabled=False,
+        help="无线策略块 0xD8..0xDB（8K/RF/低延迟，只备份不下发）",
+        label="无线策略（仅备份）",
     ),
 ]
 """快照默认覆盖的系统寄存器。

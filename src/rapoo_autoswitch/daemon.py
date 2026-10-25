@@ -2,6 +2,9 @@
 
 采用轮询探测而不是系统设备通知，是为了在 Windows / Linux / macOS 上用同一份
 代码，且不引入额外依赖。默认 3 秒一次，代价极低。
+
+变更检测：下发前对比快照与设备当前值，若设备值与快照完全一致则跳过写入，
+避免在 A-Hub 修改设置后，重新拔插鼠标时静默覆盖用户的修改。
 """
 
 from __future__ import annotations
@@ -12,14 +15,29 @@ from typing import Callable, List, Optional
 
 from . import device as dev
 from .config import load_config
-from .profiles import apply, load
+from .profiles import apply, diff, load
 
 log = logging.getLogger("rapoo_autoswitch.daemon")
 
 
-def apply_preset(session: dev.Session, preset: str) -> List[str]:
-    """下发指定快照，返回写成功的寄存器键。"""
+def apply_preset(
+    session: dev.Session,
+    preset: str,
+    skip_if_same: bool = True,
+) -> List[str]:
+    """下发指定快照，返回写成功的寄存器键。
+
+    :param skip_if_same: 若为 True（默认），先用 ``profiles.diff`` 对比设备当前值
+        与快照，无差异则跳过写入，返回空列表。这防止用户在 A-Hub 改完设置后
+        重新拔插鼠标时被静默覆盖。
+    """
     snapshot = load(preset)
+    if skip_if_same:
+        changes = diff(session, snapshot)
+        if not changes:
+            log.info("预设「%s」与设备当前值一致，跳过下发", preset)
+            return []
+        log.info("预设「%s」与设备有 %d 项差异，开始下发", preset, len(changes))
     return apply(session, snapshot)
 
 

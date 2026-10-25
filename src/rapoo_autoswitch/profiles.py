@@ -130,6 +130,9 @@ def apply(
 
     按 ``Register.order`` 排序下发——DPI 表必须早于档位数和当前档位，否则设备会
     按旧档位数解释表内容。未知寄存器排到最后，保证已知的依赖关系不被破坏。
+
+    带 ``write_enabled=False`` 的寄存器（如无线策略 0xD8）只备份、不下发；
+    需要强制写入时用 ``only`` 显式点名它们。
     """
     wanted = set(only) if only is not None else None
     slots = _slot_count(snapshot)
@@ -139,6 +142,8 @@ def apply(
         if wanted is not None and key not in wanted:
             continue
         reg = p.REGISTRY_BY_KEY.get(key)
+        if reg is not None and not reg.write_enabled and wanted is None:
+            continue  # 默认下发时跳过只备份的寄存器；显式点名才写
         plan.append((reg.order if reg else 1000, key, bytes.fromhex(hex_value), reg))
     plan.sort(key=lambda item: item[0])
 
@@ -168,8 +173,8 @@ def diff(session: Session, snapshot: Snapshot) -> Dict[str, tuple]:
 
 
 def display_name(key: str) -> str:
-    """把 ``"08:80"`` 映射回人类可读的寄存器名（若有）。"""
-    for reg in p.SYSTEM_REGISTERS:
-        if reg.key == key:
-            return reg.name
+    """把 ``"08:80"`` 映射回人类可读的寄存器标签（优先 label，其次 name）。"""
+    reg = p.REGISTRY_BY_KEY.get(key)
+    if reg:
+        return reg.label or reg.name
     return key
